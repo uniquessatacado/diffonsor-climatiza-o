@@ -1,0 +1,9 @@
+{
+  "name": "Diffonso Serviço",
+  "short_name": "Diffonso",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1037",
+  "theme_color": "#0d1037",
+  "orientation": "portrait"
+}

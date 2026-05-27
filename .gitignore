@@ -1,0 +1,19 @@
+node_modules/
+dist/
+APK PRONTO PARA INSTALAR/
+.sixth/
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.apk
+*.aab
+*.jks
+*.keystore
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
