@@ -58,6 +58,7 @@ import {
 } from "./services/mediaStore";
 import { isApiNetworkError } from "./services/api";
 import { addNetworkListener, isDeviceOnline, offlineNotice } from "./services/connectivity";
+import { EquipmentRegistrationScreen } from "./components/EquipmentRegistrationScreen";
 import "./styles.css";
 
 const rememberedLoginKey = "diffonso.rememberedLogin";
@@ -79,9 +80,12 @@ type SavedSession = {
   email: string;
   data?: {
     id?: number | string;
+    id_colaborador?: number | string;
+    idColaborador?: number | string;
     nome?: string;
     email?: string;
     isTestUser?: boolean;
+    [key: string]: unknown;
   };
 };
 
@@ -230,7 +234,13 @@ function routeFromPath(pathname: string) {
   const orderMatch = pathname.match(/^\/ordem\/([^/]+)$/);
 
   return {
-    page: orderMatch ? "order" : pathname === "/ordens" ? "orders" : "login",
+    page: orderMatch
+      ? "order"
+      : pathname === "/equipamentos/novo"
+        ? "equipment-registration"
+        : pathname === "/ordens"
+          ? "orders"
+          : "login",
     orderId: orderMatch?.[1] ?? null,
   };
 }
@@ -277,8 +287,71 @@ function saveSession(session: SavedSession) {
   }
 }
 
+function findCollaboratorId(value: unknown, depth = 0): number | string {
+  if (!value || typeof value !== "object" || depth > 8) {
+    return "";
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nestedId = findCollaboratorId(item, depth + 1);
+      if (nestedId !== "") {
+        return nestedId;
+      }
+    }
+    return "";
+  }
+
+  const record = value as Record<string, unknown>;
+  const directCandidates = Object.entries(record)
+    .filter(([key]) => /^(id_colaborador|idColaborador|codigo_colaborador|codigoColaborador|colaborador_id)$/i.test(key))
+    .map(([, candidate]) => candidate);
+
+  directCandidates.push(record.id);
+
+  for (const candidate of directCandidates) {
+    if ((typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim() !== "") {
+      return candidate;
+    }
+  }
+
+  for (const key of ["data", "dados", "colaborador", "usuario", "user", "perfil"]) {
+    const nestedId = findCollaboratorId(record[key], depth + 1);
+    if (nestedId !== "") {
+      return nestedId;
+    }
+  }
+
+  // Algumas versoes da API retornam `dados` como lista. Ao salvar a sessao,
+  // essa lista pode virar um objeto com chaves "0", "1", etc.
+  for (const nestedValue of Object.values(record)) {
+    if (!nestedValue || typeof nestedValue !== "object") {
+      continue;
+    }
+
+    const nestedId = findCollaboratorId(nestedValue, depth + 1);
+    if (nestedId !== "") {
+      return nestedId;
+    }
+  }
+
+  return "";
+}
+
 function getCollaboratorId(session?: SavedSession | null) {
-  return session?.data?.id ?? "";
+  const sessionId = findCollaboratorId(session?.data) || findCollaboratorId(session);
+
+  if (sessionId !== "") {
+    return sessionId;
+  }
+
+  try {
+    const rawAuthResponse =
+      sessionStorage.getItem("diffonso.authResponse") || localStorage.getItem("diffonso.authResponse");
+    return rawAuthResponse ? findCollaboratorId(JSON.parse(rawAuthResponse)) : "";
+  } catch {
+    return "";
+  }
 }
 
 function isTestSession(session?: SavedSession | null) {
@@ -442,9 +515,54 @@ type MediaAnswer = SavedMedia & {
   status?: "encoding" | "ready" | "error";
 };
 
-function parseStoredMedia(value: string) {
+function inferMediaType(name: string) {
+  const extension = name.split(".").pop()?.toLowerCase() ?? "";
+
+  if (["jpg", "jpeg", "png", "webp", "gif", "heic", "heif"].includes(extension)) {
+    return "image/*";
+  }
+
+  if (["mp4", "mov", "webm", "mkv", "avi"].includes(extension)) {
+    return "video/*";
+  }
+
+  return "application/octet-stream";
+}
+
+function normalizeStoredMedia(value: unknown): MediaAnswer | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  const name = typeof record.name === "string" && record.name.trim() ? record.name : "midia";
+  const size = Number(record.size);
+
+  if (!id || !Number.isFinite(size) || size < 0) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    type: typeof record.type === "string" && record.type.trim() ? record.type : inferMediaType(name),
+    size,
+    createdAt:
+      typeof record.createdAt === "string" && record.createdAt
+        ? record.createdAt
+        : new Date(0).toISOString(),
+    ...(typeof record.previewUrl === "string" ? { previewUrl: record.previewUrl } : {}),
+    ...(typeof record.previewDataUrl === "string" ? { previewDataUrl: record.previewDataUrl } : {}),
+    ...(record.status === "encoding" || record.status === "ready" || record.status === "error"
+      ? { status: record.status }
+      : {}),
+  };
+}
+
+function parseStoredMedia(value: unknown) {
   try {
-    return JSON.parse(value) as MediaAnswer;
+    return normalizeStoredMedia(typeof value === "string" ? JSON.parse(value) : value);
   } catch {
     return null;
   }
@@ -475,6 +593,103 @@ function stripMediaPreviewFields(value: string | string[]) {
 
     return JSON.stringify(storedMedia);
   });
+}
+
+function prepareClosingDraftForStorage(answers: Record<string, string | string[]>) {
+  return Object.fromEntries(
+    Object.entries(answers).map(([questionId, value]) => [
+      questionId,
+      isMediaAnswer(value) ? stripMediaPreviewFields(value) : value,
+    ]),
+  );
+}
+
+function saveClosingDraft(orderId: string, answers: Record<string, string | string[]>) {
+  localStorage.setItem(
+    getClosingDraftKey(orderId),
+    JSON.stringify(prepareClosingDraftForStorage(answers)),
+  );
+}
+
+async function restoreClosingDraft(
+  savedDraft: string | null,
+  questions: ClosingQuestion[],
+): Promise<{ answers: Record<string, string | string[]>; removedMedia: number }> {
+  if (!savedDraft) {
+    return { answers: {}, removedMedia: 0 };
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(savedDraft);
+  } catch {
+    return { answers: {}, removedMedia: 0 };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { answers: {}, removedMedia: 0 };
+  }
+
+  const storedAnswers = parsed as Record<string, unknown>;
+  const answers: Record<string, string | string[]> = {};
+  let removedMedia = 0;
+
+  for (const question of questions) {
+    const value = storedAnswers[question.id];
+
+    if (question.step === "media") {
+      const restoredMedia: string[] = [];
+
+      for (const item of Array.isArray(value) ? value : []) {
+        const media = parseStoredMedia(item);
+
+        if (!media) {
+          removedMedia += 1;
+          continue;
+        }
+
+        try {
+          const stored = await getMedia(media.id);
+
+          if (!stored?.blob || stored.blob.size <= 0) {
+            removedMedia += 1;
+            continue;
+          }
+
+          restoredMedia.push(
+            JSON.stringify({
+              id: stored.id,
+              name: stored.name || media.name,
+              type: stored.type || media.type || inferMediaType(stored.name || media.name),
+              size: stored.blob.size,
+              createdAt: stored.createdAt || media.createdAt,
+            } satisfies SavedMedia),
+          );
+        } catch {
+          removedMedia += 1;
+        }
+      }
+
+      answers[question.id] = restoredMedia;
+      continue;
+    }
+
+    if (question.step === "checkbox") {
+      answers[question.id] = Array.isArray(value)
+        ? value
+            .filter((item) => typeof item === "string" || typeof item === "number")
+            .map(String)
+        : [];
+      continue;
+    }
+
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      answers[question.id] = String(value);
+    }
+  }
+
+  return { answers, removedMedia };
 }
 
 function releaseMediaPreviewUrls(answers: Record<string, string | string[]>) {
@@ -526,8 +741,9 @@ function MediaPreview({ item, onRemove }: { item: string; onRemove: () => void }
   }
 
   const previewSource = media.previewUrl || restoredPreviewUrl || media.previewDataUrl;
-  const canShowImage = media.type.startsWith("image/") && previewSource && !previewFailed;
-  const canShowVideo = media.type.startsWith("video/") && previewSource && !previewFailed;
+  const mediaType = media.type || inferMediaType(media.name);
+  const canShowImage = mediaType.startsWith("image/") && previewSource && !previewFailed;
+  const canShowVideo = mediaType.startsWith("video/") && previewSource && !previewFailed;
 
   return (
     <div className="media-preview">
@@ -545,7 +761,7 @@ function MediaPreview({ item, onRemove }: { item: string; onRemove: () => void }
       ) : (
         <div className="media-file">
           <ImagePlus size={24} />
-          <span>{media.type.startsWith("video/") ? "Vídeo selecionado" : "Mídia selecionada"}</span>
+          <span>{mediaType.startsWith("video/") ? "Vídeo selecionado" : "Mídia selecionada"}</span>
         </div>
       )}
       <div className="media-name">
@@ -570,6 +786,7 @@ type ClosingModalProps = {
   onFinish: () => void;
   onNext: () => void;
   questions: ClosingQuestion[];
+  submitting: boolean;
 };
 
 type AppErrorBoundaryProps = {
@@ -629,20 +846,17 @@ function ClosingModal({
   onFinish,
   onNext,
   questions,
+  submitting,
 }: ClosingModalProps) {
   const question = questions[currentStep];
   const isLastStep = currentStep === questions.length - 1;
   const answer = question ? answers[question.id] : "";
   const isAnswered = question ? isQuestionAnswered(question, answer) : false;
   const canContinue = question ? !question.required || isAnswered : false;
-
-  if (!question) {
-    return null;
-  }
-
-  const isSignatureStep = question.step === "signature";
+  const isSignatureStep = question?.step === "signature";
   const answerRef = useRef(answer);
   const [mediaError, setMediaError] = useState("");
+  const [preparingMedia, setPreparingMedia] = useState(false);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const photoInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
@@ -650,6 +864,10 @@ function ClosingModal({
   useEffect(() => {
     answerRef.current = answer;
   }, [answer]);
+
+  if (!question) {
+    return null;
+  }
 
   function toggleOption(optionId: string) {
     const current = Array.isArray(answer) ? answer : [];
@@ -667,6 +885,7 @@ function ClosingModal({
       return;
     }
 
+    setPreparingMedia(true);
     const tooLargeAtSource = fileList.filter(
       (file) => file.size > (isImageFile(file) ? maxImageSourceBytes : maxMediaBytes),
     );
@@ -712,6 +931,7 @@ function ClosingModal({
     }
 
     if (acceptedFiles.length === 0) {
+      setPreparingMedia(false);
       return;
     }
 
@@ -729,38 +949,25 @@ function ClosingModal({
         metadata,
       };
     });
-    const nextMedia = prepared.map(({ metadata, file }) =>
-      JSON.stringify({
-        ...metadata,
-        previewUrl: URL.createObjectURL(file),
-        status: "ready",
-      } satisfies MediaAnswer),
-    );
-    const next = [...current, ...nextMedia];
-
-    answerRef.current = next;
-    onAnswer(question.id, next);
-
     try {
       await savePreparedMediaFiles(prepared);
-    } catch {
       const latest = Array.isArray(answerRef.current) ? answerRef.current : [];
-      const failedIds = new Set(prepared.map((item) => item.metadata.id));
-      const updated = latest.map((item) => {
-        const media = parseStoredMedia(item);
+      const nextMedia = prepared.map(({ metadata, file }) =>
+        JSON.stringify({
+          ...metadata,
+          previewUrl: URL.createObjectURL(file),
+          status: "ready",
+        } satisfies MediaAnswer),
+      );
+      const next = [...latest, ...nextMedia];
 
-        if (!media || !failedIds.has(media.id)) {
-          return item;
-        }
-
-        return JSON.stringify({
-          ...media,
-          status: "error",
-        } satisfies MediaAnswer);
-      });
-
-      answerRef.current = updated;
-      onAnswer(question.id, updated);
+      answerRef.current = next;
+      onAnswer(question.id, next);
+    } catch {
+      await Promise.all(prepared.map((item) => deleteMedia(item.metadata.id).catch(() => undefined)));
+      setMediaError("Não foi possível guardar esta mídia no aparelho. Selecione o arquivo novamente.");
+    } finally {
+      setPreparingMedia(false);
     }
   }
 
@@ -802,7 +1009,7 @@ function ClosingModal({
               </span>
               <h2 id="closing-title">{question.label}</h2>
             </div>
-            <button type="button" className="icon-button" onClick={onClose} aria-label="Fechar" title="Fechar">
+            <button type="button" className="icon-button" onClick={onClose} disabled={submitting} aria-label="Fechar" title="Fechar">
               <X size={22} />
             </button>
           </header>
@@ -853,15 +1060,15 @@ function ClosingModal({
               {Array.isArray(answer) && answer.length > 0 && (
                 <p className="selected-media">{answer.length} mídia(s) adicionada(s)</p>
               )}
-              <button type="button" className="media-action" onClick={() => galleryInputRef.current?.click()}>
+              <button type="button" className="media-action" disabled={preparingMedia || submitting} onClick={() => galleryInputRef.current?.click()}>
                 <ImagePlus size={22} />
                 <span>Selecionar mídia</span>
               </button>
-              <button type="button" className="media-action" onClick={() => photoInputRef.current?.click()}>
+              <button type="button" className="media-action" disabled={preparingMedia || submitting} onClick={() => photoInputRef.current?.click()}>
                 <ImagePlus size={22} />
                 <span>Tirar foto</span>
               </button>
-              <button type="button" className="media-action" onClick={() => videoInputRef.current?.click()}>
+              <button type="button" className="media-action" disabled={preparingMedia || submitting} onClick={() => videoInputRef.current?.click()}>
                 <ImagePlus size={22} />
                 <span>Gravar vídeo</span>
               </button>
@@ -889,6 +1096,7 @@ function ClosingModal({
                 capture="environment"
                 onChange={(event) => handleInputFiles(event.currentTarget)}
               />
+              {preparingMedia && <p className="selected-media">Preparando e salvando mídia...</p>}
               {mediaError && <p className="required-message">{mediaError}</p>}
               {Array.isArray(answer) && answer.length > 0 && (
                 <div className="media-preview-grid">
@@ -967,16 +1175,16 @@ function ClosingModal({
         </div>
 
         <footer className="closing-modal-footer">
-          <button type="button" className="stage-button secondary" onClick={onBack} disabled={currentStep === 0}>
+          <button type="button" className="stage-button secondary" onClick={onBack} disabled={currentStep === 0 || submitting || preparingMedia}>
             Voltar
           </button>
           <button
             type="button"
             className="stage-button"
             onClick={isLastStep ? onFinish : onNext}
-            disabled={!canContinue}
+            disabled={!canContinue || submitting || preparingMedia}
           >
-            {isLastStep ? "Finalizar" : "Próximo"}
+            {submitting && isLastStep ? "Enviando..." : isLastStep ? "Finalizar" : "Próximo"}
           </button>
         </footer>
       </section>
@@ -1247,7 +1455,9 @@ function App() {
   const [closingStep, setClosingStep] = useState(0);
   const [closingQuestions, setClosingQuestions] = useState<ClosingQuestion[]>([]);
   const [closingAnswers, setClosingAnswers] = useState<Record<string, string | string[]>>({});
+  const [closingSubmitting, setClosingSubmitting] = useState(false);
   const [finishModal, setFinishModal] = useState(false);
+  const [finishQueuedOffline, setFinishQueuedOffline] = useState(false);
   const [message, setMessage] = useState("");
   const [messageType, setMessageType] = useState<"info" | "error" | "success">("info");
   const [isLoggedIn, setIsLoggedIn] = useState(Boolean(savedSession));
@@ -1611,24 +1821,36 @@ function App() {
   }
 
   async function queueAndTrySync(type: OfflineActionType, orderId: string, payload: unknown) {
-    await enqueueOfflineAction(type, orderId, payload);
+    if (type === "finish_order") {
+      const existingActions = await getPendingActions();
+      await Promise.all(
+        existingActions
+          .filter((action) => action.type === "finish_order" && action.orderId === orderId)
+          .map((action) => deletePendingAction(action.id)),
+      );
+    }
+
+    const queuedAction = await enqueueOfflineAction(type, orderId, payload);
     setPendingSyncCount(await getPendingActionsCount());
 
     if (!(await isDeviceOnline())) {
       showOfflineNotice();
-      return;
+      return { offline: true, currentPending: true, error: "" };
     }
 
     const result = await syncPendingActions();
-    setPendingSyncCount(result.pending);
+    const remainingActions = await getPendingActions();
+    const currentPending = remainingActions.some((action) => action.id === queuedAction.id);
+    setPendingSyncCount(remainingActions.length);
     if (result.offline) {
       showOfflineNotice();
-      return;
+      return { ...result, currentPending };
     }
     if (result.error) {
       setErrorModal(result.error);
     }
     setSyncMessage(result.missingUrl ? "Alteração salva. Configure a URL da API para sincronizar." : result.pending > 0 ? "Alteração salva. A sincronização será tentada novamente." : "Alteração sincronizada.");
+    return { ...result, currentPending };
   }
 
   async function openPendingList() {
@@ -1695,12 +1917,24 @@ function App() {
   async function openClosingFlow() {
     const questions = await fetchClosingQuestions(selectedOrder ?? undefined);
     const savedDraft = localStorage.getItem(getClosingDraftKey(selectedOrder?.id ?? ""));
+    const restoredDraft = await restoreClosingDraft(savedDraft, questions);
 
     setClosingQuestions(questions);
-    try {
-      setClosingAnswers(savedDraft ? (JSON.parse(savedDraft) as Record<string, string | string[]>) : {});
-    } catch {
-      setClosingAnswers({});
+    setClosingAnswers(restoredDraft.answers);
+    setClosingSubmitting(false);
+
+    if (selectedOrder && savedDraft) {
+      try {
+        saveClosingDraft(selectedOrder.id, restoredDraft.answers);
+      } catch {
+        // The validated state remains available in memory for this session.
+      }
+    }
+
+    if (restoredDraft.removedMedia > 0) {
+      setSyncMessage(
+        `${restoredDraft.removedMedia} mídia(s) antiga(s) não estavam mais no aparelho e foram removidas do rascunho. As outras respostas foram mantidas.`,
+      );
     }
     setClosingStep(0);
     setClosingOrder(true);
@@ -1715,13 +1949,7 @@ function App() {
 
       if (selectedOrder) {
         try {
-          localStorage.setItem(
-            getClosingDraftKey(selectedOrder.id),
-            JSON.stringify({
-              ...next,
-              [questionId]: isMediaAnswer(value) ? stripMediaPreviewFields(value) : value,
-            }),
-          );
+          saveClosingDraft(selectedOrder.id, next);
         } catch {
           setSyncMessage("Mídias carregadas. Rascunho grande será mantido nesta tela até finalizar.");
         }
@@ -1732,6 +1960,10 @@ function App() {
   }
 
   function closeClosingFlow() {
+    if (closingSubmitting) {
+      return;
+    }
+
     releaseMediaPreviewUrls(closingAnswers);
     setClosingAnswers({});
     setClosingOrder(false);
@@ -1822,50 +2054,155 @@ function App() {
     });
   }
 
-  function finishOrder(order: ServiceOrder) {
-    const postAnswers = prepareAnswersForPost();
-    const responsibleName = String(closingAnswers.responsavel ?? "");
-    const serviceObservation = String(closingAnswers.observacao_servico ?? "");
-    const signature = String(closingAnswers.assinatura ?? "");
-    const idColaborador = getCollaboratorId(readSavedSession());
-    const idOrdemServico = order.apiOrderCode ?? order.number.replace(/\D/g, "") ?? order.id;
+  async function validateMediaBeforeFinish(order: ServiceOrder) {
+    const nextAnswers = { ...closingAnswers };
+    let firstInvalidStep = -1;
+    let removedMedia = 0;
 
-    updateOrderStatus(order, 5, {}, false);
+    for (const [questionIndex, question] of closingQuestions.entries()) {
+      if (question.step !== "media") {
+        continue;
+      }
 
-    if (order.id !== testOrderId) {
-      void queueAndTrySync("finish_order", order.id, {
-        id_colaborador: idColaborador,
-        id_ordem_servico: idOrdemServico,
-        id_situacao_ordem_servico: 5,
-        id_questionario: order.questionnaireId ?? "",
-        observacao: serviceObservation,
-        nome_responsavel: responsibleName,
-        assinatura: signature,
-        perguntas_respostas: postAnswers,
-        ordem: {
-          id: order.id,
-          numero: order.number,
-          id_ordem_servico: idOrdemServico,
-          id_cliente: order.clientId ?? "",
-          cliente: order.client,
-          endereco: order.address,
-          id_servico: order.serviceId ?? "",
-          servico: order.service,
-        },
-        questionario: {
-          id_questionario: order.questionnaireId ?? "",
-          titulo: order.questionnaireTitle ?? "",
-        },
-        respostas: postAnswers,
-      });
+      const current = Array.isArray(nextAnswers[question.id]) ? nextAnswers[question.id] as string[] : [];
+      const valid: string[] = [];
+
+      for (const item of current) {
+        const media = parseStoredMedia(item);
+
+        if (!media) {
+          removedMedia += 1;
+          continue;
+        }
+
+        try {
+          const stored = await getMedia(media.id);
+
+          if (!stored?.blob || stored.blob.size <= 0) {
+            removedMedia += 1;
+            continue;
+          }
+
+          valid.push(
+            JSON.stringify({
+              id: stored.id,
+              name: stored.name || media.name,
+              type: stored.type || media.type || inferMediaType(stored.name || media.name),
+              size: stored.blob.size,
+              createdAt: stored.createdAt || media.createdAt,
+            } satisfies SavedMedia),
+          );
+        } catch {
+          removedMedia += 1;
+        }
+      }
+
+      nextAnswers[question.id] = valid;
+
+      if (question.required && valid.length === 0) {
+        firstInvalidStep = firstInvalidStep < 0 ? questionIndex : firstInvalidStep;
+      }
     }
-    localStorage.removeItem(getClosingDraftKey(order.id));
-    closeClosingFlow();
-    setFinishModal(true);
+
+    if (removedMedia > 0) {
+      releaseMediaPreviewUrls(closingAnswers);
+      setClosingAnswers(nextAnswers);
+
+      try {
+        saveClosingDraft(order.id, nextAnswers);
+      } catch {
+        // The corrected state remains available in memory.
+      }
+
+      if (firstInvalidStep >= 0) {
+        setClosingStep(firstInvalidStep);
+      }
+
+      setErrorModal(
+        `${removedMedia} mídia(s) não estavam mais disponíveis no aparelho e foram retiradas. Adicione-as novamente antes de finalizar. As demais respostas continuam salvas.`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  async function finishOrder(order: ServiceOrder) {
+    if (closingSubmitting) {
+      return;
+    }
+
+    setClosingSubmitting(true);
+
+    try {
+      if (!(await validateMediaBeforeFinish(order))) {
+        return;
+      }
+
+      const postAnswers = prepareAnswersForPost();
+      const responsibleName = String(closingAnswers.responsavel ?? "");
+      const serviceObservation = String(closingAnswers.observacao_servico ?? "");
+      const signature = String(closingAnswers.assinatura ?? "");
+      const idColaborador = getCollaboratorId(readSavedSession());
+      const idOrdemServico = order.apiOrderCode ?? order.number.replace(/\D/g, "") ?? order.id;
+      let queuedOffline = false;
+
+      if (order.id !== testOrderId) {
+        const syncResult = await queueAndTrySync("finish_order", order.id, {
+          id_colaborador: idColaborador,
+          id_ordem_servico: idOrdemServico,
+          id_situacao_ordem_servico: 5,
+          id_questionario: order.questionnaireId ?? "",
+          observacao: serviceObservation,
+          nome_responsavel: responsibleName,
+          assinatura: signature,
+          perguntas_respostas: postAnswers,
+          ordem: {
+            id: order.id,
+            numero: order.number,
+            id_ordem_servico: idOrdemServico,
+            id_cliente: order.clientId ?? "",
+            cliente: order.client,
+            endereco: order.address,
+            id_servico: order.serviceId ?? "",
+            servico: order.service,
+          },
+          questionario: {
+            id_questionario: order.questionnaireId ?? "",
+            titulo: order.questionnaireTitle ?? "",
+          },
+          respostas: postAnswers,
+        });
+
+        if (!syncResult.offline && syncResult.currentPending) {
+          return;
+        }
+
+        queuedOffline = syncResult.offline;
+      }
+
+      updateOrderStatus(order, 5, {}, false);
+      localStorage.removeItem(getClosingDraftKey(order.id));
+      releaseMediaPreviewUrls(closingAnswers);
+      setClosingAnswers({});
+      setClosingOrder(false);
+      setClosingStep(0);
+      setFinishQueuedOffline(queuedOffline);
+      setFinishModal(true);
+    } catch (error) {
+      setErrorModal(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível preparar a finalização. O rascunho continua salvo.",
+      );
+    } finally {
+      setClosingSubmitting(false);
+    }
   }
 
   function confirmFinishedOrder() {
     setFinishModal(false);
+    setFinishQueuedOffline(false);
     navigateTo("/ordens");
   }
 
@@ -1896,8 +2233,10 @@ function App() {
     setOrders([]);
     setStatusFilter(null);
     setClosingOrder(false);
+    setClosingSubmitting(false);
     setSuspendingOrder(false);
     setFinishModal(false);
+    setFinishQueuedOffline(false);
     setClosingAnswers({});
     setClosingStep(0);
     setShowPendingList(false);
@@ -1935,8 +2274,10 @@ function App() {
     );
     localStorage.removeItem(getClosingDraftKey(testOrderId));
     setClosingOrder(false);
+    setClosingSubmitting(false);
     setSuspendingOrder(false);
     setFinishModal(false);
+    setFinishQueuedOffline(false);
     setSyncMessage("Ordem de teste reiniciada localmente.");
   }
 
@@ -2064,6 +2405,21 @@ function App() {
               <LogOut size={20} />
             </button>
           </header>
+
+          <button
+            type="button"
+            className="new-equipment-button"
+            onClick={() => navigateTo("/equipamentos/novo")}
+          >
+            <span className="new-equipment-icon">
+              <Wrench size={25} />
+            </span>
+            <span className="new-equipment-copy">
+              <strong>Cadastrar equipamento</strong>
+              <small>Novo equipamento para um cliente</small>
+            </span>
+            <ChevronRight size={25} />
+          </button>
 
           <div className={`orders-toolbar ${pendingSyncCount > 0 ? "has-pending" : ""} ${statusFilter !== null ? "is-filtered" : ""}`}>
             <button
@@ -2360,6 +2716,25 @@ function App() {
                 Reiniciar ordem de teste
               </button>
             )}
+            <button
+              type="button"
+              className="stage-button equipment-detail-action"
+              onClick={() => {
+                const query = new URLSearchParams({
+                  origemOrdem: order.id,
+                  clienteNome: order.client,
+                });
+
+                if (order.clientId) {
+                  query.set("clienteId", order.clientId);
+                }
+
+                navigateTo(`/equipamentos/novo?${query.toString()}`);
+              }}
+            >
+              <Wrench size={21} />
+              Cadastrar equipamento
+            </button>
           </div>
 
           {suspendingOrder && (
@@ -2376,6 +2751,7 @@ function App() {
               onFinish={() => finishOrder(order)}
               onNext={() => setClosingStep((current) => Math.min(closingQuestions.length - 1, current + 1))}
               questions={closingQuestions}
+              submitting={closingSubmitting}
             />
           )}
 
@@ -2383,8 +2759,12 @@ function App() {
             <div className="modal-overlay" role="dialog" aria-modal="true">
               <div className="finished-modal">
                 <CheckCircle2 size={58} />
-                <h2>Ordem finalizada</h2>
-                <p>Atendimento encerrado com sucesso.</p>
+                <h2>{finishQueuedOffline ? "Finalização salva" : "Ordem finalizada"}</h2>
+                <p>
+                  {finishQueuedOffline
+                    ? "Sem internet no momento. O envio para a API será feito automaticamente ao reconectar."
+                    : "Atendimento encerrado e enviado com sucesso."}
+                </p>
                 <button type="button" className="primary-button" onClick={confirmFinishedOrder}>
                   Voltar para ordens
                 </button>
@@ -2411,6 +2791,22 @@ function App() {
 
   if (!isLoggedIn || route.page === "login") {
     return renderLogin();
+  }
+
+  if (route.page === "equipment-registration") {
+    const session = readSavedSession();
+    const query = new URLSearchParams(window.location.search);
+    const sourceOrderId = query.get("origemOrdem") ?? "";
+
+    return (
+      <EquipmentRegistrationScreen
+        collaboratorId={getCollaboratorId(session)}
+        initialClientId={query.get("clienteId") ?? ""}
+        initialClientName={query.get("clienteNome") ?? ""}
+        isTestMode={isTestSession(session)}
+        onBack={() => navigateTo(sourceOrderId ? `/ordem/${sourceOrderId}` : "/ordens")}
+      />
+    );
   }
 
   if (route.page === "order") {

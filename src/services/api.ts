@@ -102,6 +102,48 @@ export async function postJson<T>(
   };
 }
 
+export async function postMultipart<T>(
+  url: string,
+  body: FormData,
+): Promise<ApiEnvelope<T> & { dados: T }> {
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: apiAuthorizationToken,
+      },
+      body,
+    });
+  } catch {
+    throw new ApiError(getNetworkErrorMessage(url), { url: getApiUrlForMessage(url) }, true);
+  }
+
+  let data: ApiEnvelope<T>;
+
+  try {
+    data = (await response.json()) as ApiEnvelope<T>;
+  } catch {
+    throw new ApiError(
+      `A API respondeu, mas nao retornou um JSON valido. URL: ${getApiUrlForMessage(url)}`,
+      { url: getApiUrlForMessage(url), status: response.status },
+    );
+  }
+
+  const successValue = data.sucesso ?? data.success;
+
+  if (!response.ok || !isSuccessful(successValue)) {
+    throw new ApiError(readEnvelopeMessage(data), data.dados ?? data.data ?? data);
+  }
+
+  return {
+    ...data,
+    dados: (data.dados ?? data.data) as T,
+  };
+}
+
 export function isApiNetworkError(error: unknown) {
   return error instanceof ApiError && error.isNetworkFailure;
 }

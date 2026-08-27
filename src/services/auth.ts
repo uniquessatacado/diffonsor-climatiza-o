@@ -119,14 +119,17 @@ export async function login(payload: LoginPayload): Promise<LoginResult> {
   }
 
   try {
-    const response = await postJson<{ nome: string; id: number | string }>(endpoints.authUrl, {
+    const response = await postJson<unknown>(endpoints.authUrl, {
       email: payload.email.trim(),
       senha: payload.password,
     });
+    const rawData = response.dados;
+    const primaryData = Array.isArray(rawData) ? rawData[0] : rawData;
     const data = {
-      ...response.dados,
+      ...(primaryData && typeof primaryData === "object" ? primaryData : {}),
+      authData: rawData,
       email: payload.email.trim(),
-    };
+    } as LoginUser;
 
     await saveOfflineLogin(payload.email, payload.password, data);
 

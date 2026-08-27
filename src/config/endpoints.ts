@@ -19,5 +19,14 @@ export const endpoints = {
   finishOrderUrl:
     import.meta.env.VITE_FINISH_ORDER_URL?.trim() ||
     `${apiBaseUrl}/finalizarordemservico.php`,
+  equipmentTypesUrl:
+    import.meta.env.VITE_EQUIPMENT_TYPES_URL?.trim() ||
+    `${apiBaseUrl}/tipoequipamento.php`,
+  clientsUrl:
+    import.meta.env.VITE_CLIENTS_URL?.trim() ||
+    `${apiBaseUrl}/listaclientes.php`,
+  createEquipmentUrl:
+    import.meta.env.VITE_CREATE_EQUIPMENT_URL?.trim() ||
+    `${apiBaseUrl}/cadastrar-equipamento.php`,
   syncUrl: import.meta.env.VITE_SYNC_URL?.trim() ?? "",
 };

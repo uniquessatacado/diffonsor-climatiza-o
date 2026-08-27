@@ -420,4 +420,15 @@ vite.config.ts
 - Nao deixar uma pergunta vazia quebrar a tela. Exemplo que ja aconteceu:
   - `DATAHORA` sem valor deu erro em `.split`.
 - Mostrar sempre mensagem real da API quando ela retornar erro.
+
+## Cadastro de Equipamentos
+
+A tela inicial possui acesso ao formulario mobile em `/equipamentos/novo`.
+
+- Lista de clientes: `POST /listaclientes.php`
+- Lista de tipos: `POST /tipoequipamento.php`
+- Cadastro: `POST multipart/form-data /cadastrar-equipamento.php`
+- Obrigatorios: `id_clientes`, `titulo` e `id_tipo_equipamento`
+- `id_colaborador` vem da sessao autenticada.
+- Fotos sao opcionais, permitem selecao multipla e sao enviadas como arquivos em `fileMeta[]`.
 - Se app parecer preso em erro de sync, abrir lista de pendencias e excluir a pendencia ruim.
