@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadTestModule } from "./load-test-module.mjs";
 
-const { normalizeServiceOrders, fetchServiceOrderDetailOrders, fetchServiceOrderDetails, serviceOrderStatuses } = await loadTestModule(
+const { normalizeServiceOrders, normalizeCachedServiceOrders, fetchServiceOrderDetailOrders, fetchServiceOrderDetails, serviceOrderStatuses } = await loadTestModule(
   new URL("../src/services/serviceOrders.ts", import.meta.url),
 );
 const { groupServiceOrders, getEquipmentGroupId } = await loadTestModule(
@@ -98,8 +98,8 @@ test("detail/list service names and IDs resolve on the selected equipment", () =
 
 test("different equipment statuses and questionnaires stay independent", () => {
   const normalized = normalizeServiceOrders(order({ equipamentos: [
-    { id_ordem_servico_equipamento: 1, id_situacao_ordem_servico: 5, situacao_ordem_descricao: "Finalizado pelo técnico", questionario: questionnaire(3, ["RADIO"]) },
-    { id_ordem_servico_equipamento: 2, id_situacao_ordem_servico: 1, questionario: questionnaire(14, ["MIDIA", "TEXTAREA"]) },
+    { id_ordem_servico_equipamento: 1, id_cliente_equipamento: 101, id_situacao_ordem_servico: 5, situacao_ordem_descricao: "Finalizado pelo técnico", questionario: questionnaire(3, ["RADIO"]) },
+    { id_ordem_servico_equipamento: 2, id_cliente_equipamento: 102, id_situacao_ordem_servico: 1, questionario: questionnaire(14, ["MIDIA", "TEXTAREA"]) },
   ] }), { detailsLoaded: true });
   assert.deepEqual(normalized.map((item) => item.statusId), [5, 1]);
   assert.deepEqual(normalized.map((item) => item.status), ["Finalizado pelo técnico", "Aguardando atendimento"]);
@@ -110,7 +110,7 @@ test("different equipment statuses and questionnaires stay independent", () => {
 
 test("one equipment owns its questionnaire even when multi_equipamento is false", () => {
   const [normalized] = normalizeServiceOrders(order({ multi_equipamento: false, equipamentos: [
-    { id_ordem_servico_equipamento: 1, questionario: questionnaire("equipment", ["DATA"]) },
+    { id_ordem_servico_equipamento: 1, id_cliente_equipamento: 101, questionario: questionnaire("equipment", ["DATA"]) },
   ] }));
   assert.equal(normalized.questionnaireId, "equipment");
   assert.equal(apiQuestions(normalized)[0].step, "date");
@@ -119,9 +119,9 @@ test("one equipment owns its questionnaire even when multi_equipamento is false"
 
 test("missing or null equipment questionnaire never inherits the OS questionnaire", () => {
   const normalized = normalizeServiceOrders(order({ equipamentos: [
-    { id_ordem_servico_equipamento: 1, questionario: null },
-    { id_ordem_servico_equipamento: 2 },
-    { id_ordem_servico_equipamento: 3, questionario: null, equipamento: { questionario: questionnaire("nested") } },
+    { id_ordem_servico_equipamento: 1, id_cliente_equipamento: 101, questionario: null },
+    { id_ordem_servico_equipamento: 2, id_cliente_equipamento: 102 },
+    { id_ordem_servico_equipamento: 3, id_cliente_equipamento: 103, questionario: null, equipamento: { questionario: questionnaire("nested") } },
   ] }));
   for (const item of normalized) {
     assert.equal(item.questionnaireId, undefined);
@@ -142,6 +142,201 @@ test("orders without equipment use their own questionnaire and always require si
   }
   const [withoutQuestionnaire] = normalizeServiceOrders(order({ equipamentos: [], questionario: null }));
   assert.deepEqual(withoutQuestionnaire.closingQuestions.map((question) => question.step), ["textarea", "responsible", "signature"]);
+});
+
+test("service-only placeholders keep their relation, service and status without fabricating equipment", () => {
+  for (const registered of [false, "false", "0", 0, null, undefined]) {
+    const [normalized] = normalizeServiceOrders(order({
+      multi_equipamento: "false",
+      equipamentos: [{
+        id_ordem_servico_equipamento: 73,
+        id_cliente_equipamento: 0,
+        equipamento_cadastrado: registered,
+        equipamento: null,
+        marca: "",
+        modelo: " ",
+        codigo_etiqueta: "",
+        nome_servico: "Instalação sem equipamento cadastrado",
+        id_situacao_ordem_servico: 1,
+        questionario: questionnaire("service-item-must-not-replace-order"),
+      }],
+    }));
+    assert.equal(normalized.id, "900-equipamento-73");
+    assert.equal(normalized.equipmentOrderId, "73");
+    assert.equal(normalized.equipment, undefined);
+    assert.equal(normalized.service, "Instalação sem equipamento cadastrado");
+    assert.equal(normalized.statusId, 1);
+    assert.equal(normalized.questionnaireId, "global");
+    assert.equal(normalized.questionnaireSource, "order");
+    const [group] = groupServiceOrders([normalized], serviceOrderStatuses);
+    assert.equal(group.isEquipmentBased, false);
+    assert.equal(group.id, normalized.id);
+  }
+});
+
+test("zero IDs, empty objects, missing values and registration flags do not create a machine", () => {
+  for (const equipment of [null, false, "false", [], {}, { id: 0 }, { id: "0", marca: "", modelo: "" }]) {
+    const [normalized] = normalizeServiceOrders(order({ equipamento: equipment, id_cliente_equipamento: "0", equipamento_cadastrado: "false" }));
+    assert.equal(normalized.equipment, undefined);
+    assert.equal(normalized.questionnaireId, "global");
+  }
+  for (const equipment of [null, false, "false", [], {}, { id: 0 }, { id: "0" }]) {
+    const [normalized] = normalizeServiceOrders(order({ equipamentos: [{
+      id_ordem_servico_equipamento: "0", id_cliente_equipamento: "0", equipamento: equipment, equipamento_cadastrado: true,
+    }] }));
+    assert.equal(normalized.equipment, undefined);
+    assert.equal(normalized.equipmentOrderId, undefined);
+    assert.equal(normalized.questionnaireSource, "order");
+  }
+  const [relationOnly] = normalizeServiceOrders(order({ id_ordem_servico_equipamento: 73 }));
+  assert.equal(relationOnly.equipment, undefined);
+  assert.equal(relationOnly.equipmentOrderId, "73");
+});
+
+test("grouping does not turn a relation or old empty equipment cache into an equipment screen", () => {
+  const [base] = normalizeServiceOrders(order());
+  for (const equipment of [undefined, null, false, "false", [], {}, {
+    clientEquipmentId: "0", labelCode: "", environment: "", brand: "", model: "", serialNumber: "",
+  }]) {
+    const [group] = groupServiceOrders([{ ...base, equipmentOrderId: "73", equipment }], serviceOrderStatuses);
+    assert.equal(group.isEquipmentBased, false);
+    assert.equal(group.id, base.id);
+  }
+});
+
+test("generic service titles and old display placeholders do not prove equipment existence", () => {
+  for (const equipment of [
+    { equipamento_titulo: "Instalação de ar condicionado" },
+    { equipamento: { titulo: "Instalação de ar condicionado" } },
+    { marca: "Não informado", modelo: "Não informada", codigo_etiqueta: "nao informado" },
+  ]) {
+    const [normalized] = normalizeServiceOrders(order({ equipamentos: [{ id_ordem_servico_equipamento: 7, ...equipment }] }));
+    assert.equal(normalized.equipment, undefined);
+    assert.equal(normalized.equipmentOrderId, "7");
+    assert.equal(normalized.questionnaireId, "global");
+  }
+  const [base] = normalizeServiceOrders(order());
+  const [group] = groupServiceOrders([{ ...base, equipment: {
+    title: "Instalação", model: "Não informado", labelCode: "Não informado", clientEquipmentId: "0",
+  } }], serviceOrderStatuses);
+  assert.equal(group.isEquipmentBased, false);
+  const [legacy] = normalizeServiceOrders(order({ equipamentos: [{
+    modelo: "Modelo legado", equipamento: { modelo: "Não informado" },
+  }] }));
+  assert.equal(legacy.equipment.model, "Modelo legado");
+  assert.equal(groupServiceOrders([legacy], serviceOrderStatuses)[0].isEquipmentBased, true);
+});
+
+test("a valid customer equipment ID proves a real machine even when all visible fields are absent", () => {
+  for (const equipment of [
+    { id_cliente_equipamento: 123, equipamento: null, equipamento_cadastrado: "false" },
+    { id_cliente_equipamento: "0", equipamento: { id: 123, codigo_etiqueta: "", marca: "" } },
+    { equipamento: { id_cliente_equipamento: 123 } },
+  ]) {
+    const [normalized] = normalizeServiceOrders(order({ equipamentos: [{
+      id_ordem_servico_equipamento: 7, ...equipment, questionario: questionnaire("equipment"),
+    }] }));
+    assert.equal(normalized.equipment.clientEquipmentId, "123");
+    assert.equal(normalized.questionnaireId, "equipment");
+    assert.equal(groupServiceOrders([normalized], serviceOrderStatuses)[0].isEquipmentBased, true);
+  }
+});
+
+test("an OS without a real machine and without its own questionnaire only gets fixed closing steps", () => {
+  const [normalized] = normalizeServiceOrders(order({ questionario: null, equipamentos: [{
+    id_ordem_servico_equipamento: 7, equipamento: null, questionario: questionnaire("service-only"),
+  }] }));
+  assert.equal(normalized.equipment, undefined);
+  assert.equal(normalized.questionnaireId, undefined);
+  assert.deepEqual(normalized.closingQuestions.map((question) => question.id), ["observacao_servico", "responsavel", "assinatura"]);
+  assert.equal(normalized.closingQuestions.at(-1).required, true);
+});
+
+test("service-only entries in a mixed response do not appear inside the equipment group", () => {
+  const normalized = normalizeServiceOrders(order({ equipamentos: [
+    { id_ordem_servico_equipamento: 7, equipamento: null },
+    { id_ordem_servico_equipamento: 8, id_cliente_equipamento: 123, questionario: questionnaire("real") },
+  ] }));
+  const groups = groupServiceOrders(normalized, serviceOrderStatuses);
+  const equipmentGroup = groups.find((group) => group.isEquipmentBased);
+  assert.deepEqual(equipmentGroup.orders.map((item) => item.equipmentOrderId), ["8"]);
+  assert.equal(normalized[0].questionnaireId, undefined);
+  assert.equal(normalized[1].questionnaireId, "real");
+});
+
+test("cached phantom equipment is removed on upgrade while local status and item identity survive", () => {
+  const [base] = normalizeServiceOrders(order({ equipamentos: [{
+    id_ordem_servico_equipamento: 7, equipamento: null, equipamento_cadastrado: false,
+  }] }), { detailsLoaded: true });
+  const previous = { ...base, equipment: { labelCode: "", model: "", environment: "", serialNumber: "" },
+    questionnaireSource: "equipment", questionnaireId: "wrong", statusId: 4, status: "Suspenso", statusStartedAt: "2026-09-22T15:00:00.000Z" };
+  const [normalized] = normalizeCachedServiceOrders([previous]);
+  assert.equal(normalized.id, previous.id);
+  assert.equal(normalized.equipmentOrderId, "7");
+  assert.equal(normalized.equipment, undefined);
+  assert.equal(normalized.questionnaireSource, "order");
+  assert.equal(normalized.questionnaireId, "global");
+  assert.equal(normalized.statusId, 4);
+  assert.equal(normalized.statusStartedAt, previous.statusStartedAt);
+  assert.equal(normalized.detailsLoaded, true);
+});
+
+test("cache normalization deduplicates multi-equipment parents and retains each local status", () => {
+  const previous = normalizeServiceOrders(order({ equipamentos: [
+    { id_ordem_servico_equipamento: 7, id_cliente_equipamento: 101, questionario: questionnaire("A") },
+    { id_ordem_servico_equipamento: 8, id_cliente_equipamento: 102, questionario: questionnaire("B") },
+  ] }), { detailsLoaded: true }).map((item, index) => ({ ...item, statusId: index ? 5 : 4, status: index ? "Finalizado" : "Suspenso" }));
+  const normalized = normalizeCachedServiceOrders(previous);
+  assert.equal(normalized.length, 2);
+  assert.deepEqual(normalized.map((item) => item.id), previous.map((item) => item.id));
+  assert.deepEqual(normalized.map((item) => item.statusId), [4, 5]);
+  assert.deepEqual(normalized.map((item) => item.questionnaireId), ["A", "B"]);
+  assert.ok(normalized.every((item) => item.detailsLoaded));
+  assert.equal(groupServiceOrders(normalized, serviceOrderStatuses).length, 1);
+});
+
+test("cache migration keeps detailed equipment rows when an older list raw omits associations", () => {
+  const previous = normalizeServiceOrders(order({ equipamentos: [
+    { id_ordem_servico_equipamento: 7, id_cliente_equipamento: 101, questionario: questionnaire("A", ["MIDIA"]) },
+    { id_ordem_servico_equipamento: 8, id_cliente_equipamento: 102, questionario: questionnaire("B") },
+  ] }), { detailsLoaded: true }).map((item, index) => ({ ...item, raw: order(), statusId: index ? 5 : 4 }));
+  const normalized = normalizeCachedServiceOrders(previous);
+  assert.equal(normalized.length, 2);
+  assert.deepEqual(normalized.map((item) => item.id), previous.map((item) => item.id));
+  assert.deepEqual(normalized.map((item) => item.statusId), [4, 5]);
+  assert.deepEqual(normalized.map((item) => item.questionnaireId), ["A", "B"]);
+  assert.equal(apiQuestions(normalized[0])[0].step, "media");
+  const explicitEmpty = normalizeCachedServiceOrders(previous.map((item) => ({ ...item, raw: order({ equipamentos: [] }) })));
+  assert.equal(explicitEmpty.length, 1);
+  assert.equal(explicitEmpty[0].equipment, undefined);
+  assert.equal(explicitEmpty[0].questionnaireId, "global");
+});
+
+test("cache preserves loaded equipment questionnaires when its latest raw payload is only a list summary", () => {
+  const detailedRaw = order({ equipamentos: [{ id_ordem_servico_equipamento: 7, id_cliente_equipamento: 101,
+    nome_servico: "Instalação do equipamento", id_servico: 17,
+    equipamento: { id: 101, marca: "CONSUL", modelo: "CBJ18CBBNA" }, questionario: questionnaire("A", ["MIDIA"]) }] });
+  const [previous] = normalizeServiceOrders(detailedRaw, { detailsLoaded: true });
+  previous.raw = order({ equipamentos: [{ id_ordem_servico_equipamento: 7, id_cliente_equipamento: 101 }] });
+  const [normalized] = normalizeCachedServiceOrders([previous]);
+  assert.equal(normalized.questionnaireId, "A");
+  assert.equal(apiQuestions(normalized)[0].step, "media");
+  assert.equal(normalized.equipment.brand, "CONSUL");
+  assert.equal(normalized.equipment.model, "CBJ18CBBNA");
+  assert.equal(normalized.service, "Instalação do equipamento");
+  assert.equal(normalized.serviceId, "17");
+  const custom = { ...previous, raw: { teste: true } };
+  assert.equal(normalizeCachedServiceOrders([custom])[0], custom);
+});
+
+test("an equipment-free cached OS keeps its completed questionnaire detail when the list only has its title", () => {
+  const [previous] = normalizeServiceOrders(order({ questionario: questionnaire("global", ["MIDIA"]) }), { detailsLoaded: true });
+  previous.raw = order({ questionario: { id_questionario: "global", titulo: "Resumo" } });
+  const [normalized] = normalizeCachedServiceOrders([previous]);
+  assert.equal(normalized.equipment, undefined);
+  assert.equal(apiQuestions(normalized)[0].step, "media");
+  previous.raw = order({ questionario: null });
+  assert.equal(apiQuestions(normalizeCachedServiceOrders([previous])[0]).length, 0);
 });
 
 test("legacy single equipment without relation ID retains OS identity and equipment questionnaire", () => {
@@ -237,8 +432,8 @@ test("saved responses are taken only from the selected source, never from answer
   const globalAnswers = [{ id_pergunta: 1, resposta: "Global" }];
   const equipmentAnswers = [{ id_pergunta: 1, midias: [{ id: "media-a", url: "https://example.test/a.jpg" }] }];
   const normalized = normalizeServiceOrders(order({ perguntas_respostas: globalAnswers, equipamentos: [
-    { id_ordem_servico_equipamento: 1, questionario: questionnaire(1, ["RADIO"]), perguntas_respostas: equipmentAnswers },
-    { id_ordem_servico_equipamento: 2, questionario: questionnaire(2, ["RADIO"]) },
+    { id_ordem_servico_equipamento: 1, id_cliente_equipamento: 101, questionario: questionnaire(1, ["RADIO"]), perguntas_respostas: equipmentAnswers },
+    { id_ordem_servico_equipamento: 2, id_cliente_equipamento: 102, questionario: questionnaire(2, ["RADIO"]) },
   ] }));
   assert.deepEqual(normalized[0].questionnaireResponses, equipmentAnswers);
   assert.equal(normalized[1].questionnaireResponses, undefined);
@@ -259,8 +454,8 @@ test("detail fetch normalizes every equipment, keeps the existing request, and s
   globalThis.fetch = async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
     return new Response(JSON.stringify({ sucesso: true, dados: order({ equipamentos: [
-      { id_ordem_servico_equipamento: 1, questionario: questionnaire("A") },
-      { id_ordem_servico_equipamento: 2, questionario: questionnaire("B") },
+      { id_ordem_servico_equipamento: 1, id_cliente_equipamento: 101, questionario: questionnaire("A") },
+      { id_ordem_servico_equipamento: 2, id_cliente_equipamento: 102, questionario: questionnaire("B") },
     ] }) }), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   try {

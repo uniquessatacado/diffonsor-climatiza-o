@@ -33,6 +33,7 @@ import {
   fetchServiceOrderDetailOrders,
   fetchServiceOrders,
   getTestServiceOrders,
+  normalizeCachedServiceOrders,
   serviceOrderStatuses,
   type ClosingQuestion,
   type ServiceOrder,
@@ -64,6 +65,9 @@ import {
   type ServiceOrderGroup,
 } from "./services/serviceOrderGroups";
 import { EquipmentRegistrationScreen } from "./components/EquipmentRegistrationScreen";
+import { BrazilianDateInput } from "./components/BrazilianDateInput";
+import { formatBrazilianDate, formatBrazilianDateTime } from "./services/dateFormat";
+import { getOrderDetailsPath, getOrderEntryPath, routeFromPath } from "./services/orderNavigation";
 import {
   readClosingDraft,
   writeClosingDraft,
@@ -111,7 +115,7 @@ function formatLastCheck(date: Date | null) {
     return "Aguardando primeira verificação";
   }
 
-  return `Última verificação ${date.toLocaleDateString("pt-BR")} às ${date.toLocaleTimeString("pt-BR", {
+  return `Última verificação ${formatBrazilianDate(date)} às ${date.toLocaleTimeString("pt-BR", {
     hour: "2-digit",
     minute: "2-digit",
   })}`;
@@ -280,21 +284,6 @@ function getClosingDraftKey(orderId: string) {
   return `diffonso.closingDraft.${orderId}`;
 }
 
-function routeFromPath(pathname: string) {
-  const orderMatch = pathname.match(/^\/ordem\/([^/]+)$/);
-
-  return {
-    page: orderMatch
-      ? "order"
-      : pathname === "/equipamentos/novo"
-        ? "equipment-registration"
-        : pathname === "/ordens"
-          ? "orders"
-          : "login",
-    orderId: orderMatch?.[1] ?? null,
-  };
-}
-
 function readSavedSession() {
   try {
     const session = localStorage.getItem(sessionKey) || sessionStorage.getItem(sessionKey);
@@ -412,7 +401,7 @@ async function readOrdersCache(session?: SavedSession | null) {
     const cachedDb = await readCachedOrders<ServiceOrder>(key);
 
     if (cachedDb?.orders.length) {
-      return cachedDb;
+      return { ...cachedDb, orders: normalizeCachedServiceOrders(cachedDb.orders) };
     }
   } catch {
     // LocalStorage fallback keeps older caches readable.
@@ -423,7 +412,7 @@ async function readOrdersCache(session?: SavedSession | null) {
 
     if (cachedLocal) {
       return {
-        orders: JSON.parse(cachedLocal) as ServiceOrder[],
+        orders: normalizeCachedServiceOrders(JSON.parse(cachedLocal) as ServiceOrder[]),
         updatedAt: undefined,
       };
     }
@@ -977,22 +966,26 @@ function ClosingModal({
           )}
 
           {question.step === "date" && (
-            <input
+            <BrazilianDateInput
+              key={question.id}
               className="large-input"
-              type="date"
+              ariaLabel={question.label}
+              required={question.required}
               value={String(answer ?? "")}
-              onChange={(event) => onAnswer(question.id, event.target.value)}
+              onChange={(value) => onAnswer(question.id, value)}
             />
           )}
 
           {question.step === "datetime" && (
             <div className="datetime-fields">
-              <input
+              <BrazilianDateInput
+                key={question.id}
                 className="large-input"
-                type="date"
+                ariaLabel={question.label}
+                required={question.required}
                 value={parseDatetimeAnswer(answer).date}
-                onChange={(event) =>
-                  onAnswer(question.id, `${event.target.value}|${parseDatetimeAnswer(answer).time}`)
+                onChange={(value) =>
+                  onAnswer(question.id, `${value}|${parseDatetimeAnswer(answer).time}`)
                 }
               />
               <input
@@ -1399,6 +1392,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [ordersLoading, setOrdersLoading] = useState(false);
+  const [openingOrderId, setOpeningOrderId] = useState<string | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState("");
   const [resolvedDetailRoute, setResolvedDetailRoute] = useState<string | null>(null);
@@ -1418,6 +1412,7 @@ function App() {
   activeClosingContext.current = closingOrder ? closingContext : null;
   const closingDraftsByScope = useRef(new Map<string, ClosingDraft>());
   const detailRequests = useRef(new Map<string, Promise<ServiceOrder[]>>());
+  const preparedDetailRoute = useRef<string | null>(null);
   const activeRoute = useRef(route);
   activeRoute.current = route;
   const ordersRef = useRef(orders);
@@ -1488,7 +1483,7 @@ function App() {
     setClosingOrder(false);
     setClosingContext(null);
     setSuspendingOrder(false);
-  }, [route.page, route.orderId]);
+  }, [route.page, route.orderId, route.overview]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setElapsedTicker((current) => current + 1), 15000);
@@ -1659,6 +1654,13 @@ function App() {
 
     let cancelled = false;
     const routeId = route.orderId;
+    if (preparedDetailRoute.current === routeId) {
+      preparedDetailRoute.current = null;
+      setResolvedDetailRoute(routeId);
+      setDetailsLoading(false);
+      setDetailsError("");
+      return;
+    }
     setDetailsLoading(true);
     setResolvedDetailRoute(null);
     setDetailsError("");
@@ -1842,7 +1844,9 @@ function App() {
       setLastCheckedAt(new Date());
       if (activeRoute.current.orderId === orderId && !detailedOrders.some((order) => order.id === orderId)) {
         const group = groupServiceOrders(detailedOrders, serviceOrderStatuses)[0];
-        if (group && group.id !== orderId) navigateTo(`/ordem/${group.id}`);
+        if (group && group.id !== orderId) {
+          navigateTo(activeRoute.current.overview && group.isEquipmentBased ? getOrderDetailsPath(group) : getOrderEntryPath(group));
+        }
       }
       return detailedOrders;
     } catch (error) {
@@ -1850,6 +1854,26 @@ function App() {
       throw error;
     } finally {
       if (detailRequests.current.get(requestKey) === request) detailRequests.current.delete(requestKey);
+    }
+  }
+
+  async function openServiceOrder(group: ServiceOrderGroup<ServiceOrder>) {
+    if (openingOrderId) return;
+    setOpeningOrderId(group.id);
+    try {
+      const details = await loadServiceOrderDetails(group.id);
+      if (!details?.length || activeRoute.current.page !== "orders") return;
+      const resolvedGroup = groupServiceOrders(details, serviceOrderStatuses)[0];
+      if (!resolvedGroup) return;
+      const path = getOrderEntryPath(resolvedGroup);
+      const routeId = routeFromPath(path).orderId;
+      preparedDetailRoute.current = routeId;
+      setResolvedDetailRoute(routeId);
+      navigateTo(path);
+    } catch (error) {
+      setErrorModal(error instanceof Error ? error.message : "Não foi possível carregar os detalhes desta ordem.");
+    } finally {
+      setOpeningOrderId(null);
     }
   }
 
@@ -2544,7 +2568,7 @@ function App() {
                 {order.scheduledAt && (
                   <p className="order-row">
                     <span className="row-icon"><CalendarDays size={23} /></span>
-                    {order.scheduledAt}
+                    {formatBrazilianDateTime(order.scheduledAt, { fallback: order.scheduledAt === "Hoje" ? "Hoje" : "Não informado" })}
                   </p>
                 )}
                 {shouldShowElapsedStatus(order.statusId) && (
@@ -2555,10 +2579,11 @@ function App() {
                 <button
                   type="button"
                   className="primary-button order-action"
-                  onClick={() => navigateTo(`/ordem/${group.id}`)}
+                  disabled={openingOrderId !== null}
+                  onClick={() => void openServiceOrder(group)}
                 >
                   <ClipboardList size={24} />
-                  Abrir ordem de serviço
+                  {openingOrderId === group.id ? "Carregando ordem..." : "Abrir ordem de serviço"}
                   <ChevronRight size={26} />
                 </button>
               </article>
@@ -2608,7 +2633,7 @@ function App() {
                           <strong>OS {action.orderCode}</strong>
                           <span>{formatPendingType(action.type)}</span>
                           <small>
-                            Tentativas: {action.attempts} | {new Date(action.createdAt).toLocaleString("pt-BR")}
+                            Tentativas: {action.attempts} | {formatBrazilianDateTime(action.createdAt, { includeSeconds: true })}
                           </small>
                         </div>
                         <button type="button" onClick={() => void removePending(action.id)}>
@@ -2640,9 +2665,9 @@ function App() {
     );
   }
 
-  function renderOrderDetail(order: ServiceOrder) {
-    const canMove = ![2, 3, 5, 6].includes(order.statusId);
-    const canStartService = ![3, 5, 6].includes(order.statusId);
+  function renderOrderDetail(order: ServiceOrder, overviewGroup?: ServiceOrderGroup<ServiceOrder>) {
+    const canMove = !overviewGroup && ![2, 3, 5, 6].includes(order.statusId);
+    const canStartService = !overviewGroup && ![3, 5, 6].includes(order.statusId);
     const canSuspend = [1, 2, 3].includes(order.statusId);
     const parentEquipmentGroup = orderGroups.find((group) => group.isEquipmentBased && group.orders.some((item) => item.id === order.id));
 
@@ -2691,7 +2716,7 @@ function App() {
             {order.scheduledAt && (
               <p className="order-row">
                 <span className="row-icon"><CalendarDays size={23} /></span>
-                {order.scheduledAt}
+                {formatBrazilianDateTime(order.scheduledAt, { fallback: order.scheduledAt === "Hoje" ? "Hoje" : "Não informado" })}
               </p>
             )}
             <p className="order-row">
@@ -2705,7 +2730,29 @@ function App() {
             )}
           </article>
 
-          {order.equipment && (
+          {overviewGroup && (
+            <article className="detail-card">
+              <label htmlFor="order-equipment-target">Equipamento do atendimento</label>
+              <select id="order-equipment-target" className="large-input" value="" onChange={(event) => {
+                if (event.target.value) navigateTo(`/ordem/${event.target.value}`);
+              }}>
+                <option value="" disabled>Selecione o equipamento</option>
+                {overviewGroup.orders.map((item, index) => (
+                  <option key={item.id} value={item.id}>
+                    {item.equipment?.labelCode ? `Etiqueta ${item.equipment.labelCode}` : `Equipamento ${index + 1}`}
+                    {item.equipment?.environment ? ` — ${item.equipment.environment}` : ""}
+                  </option>
+                ))}
+              </select>
+              <p>Selecione o equipamento para acessar as ações do seu atendimento.</p>
+            </article>
+          )}
+
+          {!overviewGroup && !order.equipment && (
+            <p className="detail-card">Esta OS não tem equipamento cadastrado.</p>
+          )}
+
+          {!overviewGroup && order.equipment && (
             <details className="detail-card equipment-detail-fields">
               <summary>Dados do equipamento</summary>
               <dl className="equipment-selection-data">
@@ -2754,6 +2801,7 @@ function App() {
               <button
                 type="button"
                 className="stage-button secondary"
+                disabled={Boolean(overviewGroup)}
                 onClick={() => setSuspendingOrder(true)}
               >
                 <PauseCircle size={21} />
@@ -2761,7 +2809,7 @@ function App() {
               </button>
             )}
             {order.statusId === 3 && (
-              <button type="button" className="stage-button finish" disabled={closingLoading} onClick={openClosingFlow}>
+              <button type="button" className="stage-button finish" disabled={closingLoading || Boolean(overviewGroup)} onClick={openClosingFlow}>
                 <Flag size={21} />
                 {closingLoading ? "Carregando atendimento..." : "Encerrar atendimento"}
               </button>
@@ -2776,7 +2824,7 @@ function App() {
               className="stage-button equipment-detail-action"
               onClick={() => {
                 const query = new URLSearchParams({
-                  origemOrdem: order.id,
+                  origemOrdem: overviewGroup?.id ?? order.id,
                   clienteNome: order.client,
                 });
 
@@ -2881,6 +2929,11 @@ function App() {
             </span>
           </article>
 
+          <button type="button" className="stage-button" onClick={() => navigateTo(getOrderDetailsPath(group))}>
+            <ClipboardList size={21} />
+            Detalhes da OS
+          </button>
+
           <div className="equipment-selection-list">
             {group.orders.map((equipmentOrder) => {
               const equipment = equipmentOrder.equipment;
@@ -2981,6 +3034,7 @@ function App() {
     }
 
     if (selectedOrderGroup?.isEquipmentBased) {
+      if (route.overview) return renderOrderDetail(selectedOrderGroup.representative, selectedOrderGroup);
       return renderEquipmentList(selectedOrderGroup);
     }
 

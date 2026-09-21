@@ -1,0 +1,69 @@
+.brazilian-date-field {
+  width: 100%;
+  min-width: 0;
+}
+
+.brazilian-date-control {
+  position: relative;
+}
+
+.brazilian-date-control > .brazilian-date-text {
+  width: 100%;
+  min-width: 0;
+  padding-right: 58px;
+}
+
+.brazilian-date-calendar {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  transform: translateY(-50%);
+  border-radius: 8px;
+  color: inherit;
+}
+
+.brazilian-date-calendar:focus-within {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.brazilian-date-calendar > input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.brazilian-date-calendar > input::-webkit-calendar-picker-indicator {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.brazilian-date-calendar:has(input:disabled) {
+  opacity: 0.5;
+}
+
+.brazilian-date-error {
+  display: block;
+  margin-top: 7px;
+  color: #b42318;
+}
+
+@media (max-width: 520px) {
+  .closing-modal .datetime-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

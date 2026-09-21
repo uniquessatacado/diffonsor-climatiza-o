@@ -47,6 +47,19 @@ export function aggregateEquipmentStatus(orders: GroupableServiceOrder[]) {
   return 1;
 }
 
+function hasEquipmentData(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const equipment = value as Record<string, unknown>;
+  const equipmentId = String(equipment.clientEquipmentId ?? "").trim();
+  if (equipmentId && !["false", "null", "undefined", "nan", "infinity"].includes(equipmentId.toLowerCase())
+    && (Number.isNaN(Number(equipmentId)) || Number(equipmentId) > 0)) return true;
+  return ["labelCode", "brand", "model", "serialNumber", "code"].some((key) => {
+    if (typeof equipment[key] !== "string" && typeof equipment[key] !== "number") return false;
+    const text = String(equipment[key]).trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    return text && !["nao informado", "nao informada", "servico nao informado", "false", "null", "undefined"].includes(text);
+  });
+}
+
 export function groupServiceOrders<T extends GroupableServiceOrder>(
   orders: T[],
   statusLabels: Record<number, string>,
@@ -54,7 +67,7 @@ export function groupServiceOrders<T extends GroupableServiceOrder>(
   const groups = new Map<string, ServiceOrderGroup<T>>();
 
   orders.forEach((order) => {
-    if (!order.equipmentOrderId && !order.equipment) {
+    if (!hasEquipmentData(order.equipment)) {
       groups.set(`legado-${order.id}`, {
         id: order.id,
         isEquipmentBased: false,

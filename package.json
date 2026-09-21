@@ -1,11 +1,11 @@
 {
   "name": "diffonso-vistoria-app",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "private": true,
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test scripts/test-service-orders.mjs tests/closingDrafts.test.mjs scripts/test-offline-sync.cjs scripts/test-closing-flow.cjs",
+    "test": "node --test scripts/test-service-orders.mjs tests/closingDrafts.test.mjs scripts/test-offline-sync.cjs scripts/test-closing-flow.cjs scripts/test-order-navigation.cjs tests/dateFormat.test.mjs tests/brazilianDateInput.test.mjs",
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",

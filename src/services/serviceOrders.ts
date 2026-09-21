@@ -213,6 +213,38 @@ function readText(...values: unknown[]) {
   return "";
 }
 
+function readEquipmentId(...values: unknown[]) {
+  for (const value of values) {
+    const id = readText(value);
+    if (!id || ["false", "null", "undefined", "nan", "infinity"].includes(id.toLowerCase())) continue;
+    const numericId = Number(id);
+    if (Number.isFinite(numericId) && numericId <= 0) continue;
+    return id;
+  }
+  return "";
+}
+
+function hasEquipmentIdentityText(value: unknown) {
+  const text = readText(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  return Boolean(text && !["nao informado", "nao informada", "servico nao informado", "false", "null", "undefined"].includes(text));
+}
+
+function hasRealEquipment(item: ApiOrderEquipment) {
+  const nestedEquipment = asRecord(item.equipamento);
+  if (readEquipmentId(item.id_cliente_equipamento, nestedEquipment?.id_cliente_equipamento, nestedEquipment?.id)) {
+    return true;
+  }
+
+  // A service relation or registration flag alone does not identify a machine.
+  // Legacy/unregistered equipment can instead provide concrete identifying data.
+  const identifyingKeys = [
+    "codigo_etiqueta", "codigoEtiqueta", "etiqueta", "tag", "tag_code",
+    "marca", "modelo", "modelo_equipamento", "numero_serie", "numeroSerie", "serie", "serial",
+  ];
+  return identifyingKeys.some((key) => hasEquipmentIdentityText(nestedEquipment?.[key]) || hasEquipmentIdentityText(item[key]))
+    || hasEquipmentIdentityText(nestedEquipment?.codigo) || hasEquipmentIdentityText(item.codigo_equipamento);
+}
+
 function formatAddress(order: Record<string, unknown>) {
   return [
     [readText(order.endereco), readText(order.numero)].filter(Boolean).join(", "),
@@ -293,14 +325,18 @@ function readEquipmentText(
   keys: string[],
 ) {
   const nestedEquipment = asRecord(equipment.equipamento);
+  let placeholder = "";
 
   for (const key of keys) {
     // The nested equipment is authoritative; blank aliases must not hide its data.
-    const value = readText(nestedEquipment?.[key], equipment[key]);
-    if (value) return value;
+    for (const candidate of [nestedEquipment?.[key], equipment[key]]) {
+      const value = readText(candidate);
+      if (hasEquipmentIdentityText(value)) return value;
+      if (!placeholder && value) placeholder = value;
+    }
   }
 
-  return "";
+  return placeholder;
 }
 
 function normalizeEquipment(equipment: ApiOrderEquipment): ServiceOrderEquipment {
@@ -308,7 +344,7 @@ function normalizeEquipment(equipment: ApiOrderEquipment): ServiceOrderEquipment
   const address = formatAddress(Object.fromEntries(addressKeys.map((key) => [key, readEquipmentText(equipment, [key])])));
 
   return {
-    clientEquipmentId: readText(equipment.id_cliente_equipamento, asRecord(equipment.equipamento)?.id) || undefined,
+    clientEquipmentId: readEquipmentId(equipment.id_cliente_equipamento, asRecord(equipment.equipamento)?.id_cliente_equipamento, asRecord(equipment.equipamento)?.id) || undefined,
     code: readEquipmentText(equipment, ["codigo", "codigo_equipamento"]),
     labelCode: readEquipmentText(equipment, [
       "codigo_etiqueta",
@@ -351,15 +387,13 @@ function getAssignedEquipment(order: ApiOrder): ApiOrderEquipment[] {
     return [{
       ...singleEquipment,
       equipamento: asRecord(singleEquipment.equipamento) ?? singleEquipment,
-      id_ordem_servico_equipamento: readText(singleEquipment.id_ordem_servico_equipamento, order.id_ordem_servico_equipamento) || undefined,
-      id_cliente_equipamento: readText(singleEquipment.id_cliente_equipamento, order.id_cliente_equipamento) || undefined,
+      id_ordem_servico_equipamento: readEquipmentId(singleEquipment.id_ordem_servico_equipamento, order.id_ordem_servico_equipamento) || undefined,
+      id_cliente_equipamento: readEquipmentId(singleEquipment.id_cliente_equipamento, order.id_cliente_equipamento) || undefined,
     }];
   }
 
-  const hasFlatEquipment = readText(order.id_ordem_servico_equipamento)
-    || (readText(order.id_cliente_equipamento) && Number(order.id_cliente_equipamento) !== 0)
-    || ["codigo_etiqueta", "codigoEtiqueta", "modelo_equipamento", "numero_serie", "numeroSerie"].some((key) => readText(order[key]));
-  if (!hasFlatEquipment) return [];
+  const hasFlatItem = readEquipmentId(order.id_ordem_servico_equipamento) || hasRealEquipment(order);
+  if (!hasFlatItem) return [];
 
   // Flattened legacy equipment metadata must never import the OS questionnaire.
   const {
@@ -391,18 +425,22 @@ function normalizeServiceOrder(
   equipment: ApiOrderEquipment | undefined,
   detailsLoaded: boolean,
   legacyEquipmentKey?: string,
+  orderHasEquipment = false,
 ): ServiceOrder {
-  const equipmentOrderId = readText(equipment?.id_ordem_servico_equipamento) || undefined;
+  const equipmentOrderId = readEquipmentId(equipment?.id_ordem_servico_equipamento) || undefined;
   const statusId = normalizeStatusId(readText(equipment?.id_situacao_ordem_servico, order.id_situacao_ordem_servico));
-  // Existence of equipment, including a single legacy equipment, determines ownership.
-  const questionnaireSource = equipment ? getEquipmentQuestionnaireSource(equipment) : order;
+  const containsEquipment = Boolean(equipment && hasRealEquipment(equipment));
+  // Service-only entries may have relation IDs, but only real equipment owns an equipment questionnaire.
+  const questionnaireSource = containsEquipment && equipment
+    ? getEquipmentQuestionnaireSource(equipment)
+    : orderHasEquipment ? {} : order;
   const questionnaireId = readText(questionnaireSource.questionario?.id_questionario, questionnaireSource.questionario_id);
   const questionnaireTitle = readText(questionnaireSource.questionario?.titulo, questionnaireSource.questionario_titulo);
-  const questionnaireResponses = equipment?.perguntas_respostas ?? equipment?.respostas
+  const questionnaireResponses = (containsEquipment ? equipment?.perguntas_respostas ?? equipment?.respostas : undefined)
     ?? questionnaireSource.perguntas_respostas ?? questionnaireSource.respostas;
   const apiId = readText(order.id, order.ordem_servico);
   const apiOrderCode = readText(order.ordem_servico, order.id);
-  const normalizedEquipment = equipment ? normalizeEquipment(equipment) : undefined;
+  const normalizedEquipment = containsEquipment && equipment ? normalizeEquipment(equipment) : undefined;
   const itemId = equipmentOrderId
     ? `${apiId}-equipamento-${equipmentOrderId}`
     : legacyEquipmentKey !== undefined
@@ -437,7 +475,7 @@ function normalizeServiceOrder(
       || readText(order.data_hora_servico) || undefined,
     questionnaireId: questionnaireId || undefined,
     questionnaireTitle: questionnaireTitle || undefined,
-    questionnaireSource: equipment ? "equipment" : "order",
+    questionnaireSource: containsEquipment ? "equipment" : "order",
     questionnaireResolved: detailsLoaded,
     detailsLoaded,
     questionnaireResponses: Array.isArray(questionnaireResponses) ? questionnaireResponses : undefined,
@@ -462,9 +500,10 @@ export function normalizeServiceOrders(
       return [normalizeServiceOrder(order, undefined, options.detailsLoaded === true)];
     }
 
-    const legacyEquipmentIds = assignedEquipment.map((equipment) => readText(equipment.id_ordem_servico_equipamento)
+    const orderHasEquipment = assignedEquipment.some(hasRealEquipment);
+    const legacyEquipmentIds = assignedEquipment.map((equipment) => readEquipmentId(equipment.id_ordem_servico_equipamento)
       ? ""
-      : readText(equipment.id_cliente_equipamento, asRecord(equipment.equipamento)?.id));
+      : readEquipmentId(equipment.id_cliente_equipamento, asRecord(equipment.equipamento)?.id_cliente_equipamento, asRecord(equipment.equipamento)?.id));
     return assignedEquipment.map((equipment, index) => {
       const clientEquipmentId = legacyEquipmentIds[index];
       const duplicated = clientEquipmentId && legacyEquipmentIds.filter((id) => id === clientEquipmentId).length > 1;
@@ -472,7 +511,76 @@ export function normalizeServiceOrders(
         ? `${clientEquipmentId}${duplicated ? `-item-${index}` : ""}`
         : `indice-${index}`;
       return normalizeServiceOrder(order, equipment, options.detailsLoaded === true,
-        assignedEquipment.length > 1 ? legacyEquipmentKey : undefined);
+        assignedEquipment.length > 1 ? legacyEquipmentKey : undefined, orderHasEquipment);
+    });
+  });
+}
+
+export function normalizeCachedServiceOrders(cachedOrders: ServiceOrder[]): ServiceOrder[] {
+  const processedParents = new Set<string>();
+  return cachedOrders.flatMap((cached) => {
+    const raw = asRecord(cached.raw);
+    if (!raw || !readText(raw.ordem_servico) || !readText(raw.id)) return [cached];
+    const parentKey = `${readText(raw.id)}:${readText(raw.ordem_servico)}`;
+    if (processedParents.has(parentKey)) return [];
+    processedParents.add(parentKey);
+
+    const previousItems = cachedOrders.filter((item) =>
+      (item.apiId ?? item.id) === readText(raw.id) && item.apiOrderCode === readText(raw.ordem_servico));
+    const associationWasProvided = ["equipamentos", "equipamento", "id_cliente_equipamento", "id_ordem_servico_equipamento"]
+      .some((key) => Object.prototype.hasOwnProperty.call(raw, key)) || hasRealEquipment(raw as ApiOrder);
+    const hasDetailedEquipment = previousItems.some((item) => item.detailsLoaded && item.equipment
+      && (readEquipmentId(item.equipment.clientEquipmentId)
+        || [item.equipment.labelCode, item.equipment.brand, item.equipment.model, item.equipment.serialNumber, item.equipment.code]
+          .some(hasEquipmentIdentityText)));
+    // Old list responses omit associations entirely. Their raw payload must not erase cached detail rows.
+    if (!associationWasProvided && hasDetailedEquipment) return previousItems;
+
+    const apiItems = getAssignedEquipment(raw as ApiOrder);
+    return normalizeServiceOrders(raw).map((normalized) => {
+      const previous = previousItems.find((item) => item.id === normalized.id);
+      if (!previous) return normalized;
+      const apiItem = apiItems.find((item) => normalized.equipmentOrderId
+        ? readEquipmentId(item.id_ordem_servico_equipamento) === normalized.equipmentOrderId
+        : normalized.equipment?.clientEquipmentId
+          ? readEquipmentId(item.id_cliente_equipamento, asRecord(item.equipamento)?.id) === normalized.equipment.clientEquipmentId
+          : apiItems.length === 1);
+      const cachedQuestionnaireSource = normalized.equipment && apiItem
+        ? getEquipmentQuestionnaireSource(apiItem)
+        : raw as ApiQuestionnaireSource;
+      const sameEquipment = Boolean(normalized.equipment && previous.equipment
+        && normalized.equipment.clientEquipmentId === previous.equipment.clientEquipmentId);
+      const keepDetailedService = previous.detailsLoaded
+        && normalized.equipmentOrderId === previous.equipmentOrderId
+        && normalized.equipment?.clientEquipmentId === previous.equipment?.clientEquipmentId;
+      // A cache refresh can store a list raw payload alongside an already loaded questionnaire.
+      const keepDetailedQuestionnaire = previous.detailsLoaded
+        && previous.questionnaireSource === normalized.questionnaireSource
+        && (sameEquipment || (!normalized.equipment && !previous.equipment))
+        && cachedQuestionnaireSource.questionario !== null
+        && !Array.isArray(cachedQuestionnaireSource.questionario?.perguntas)
+        && (!normalized.questionnaireId || normalized.questionnaireId === previous.questionnaireId);
+
+      return {
+        ...normalized,
+        ...(keepDetailedService ? { service: previous.service, serviceId: previous.serviceId } : {}),
+        ...(sameEquipment && normalized.equipment ? {
+          equipment: Object.fromEntries(Object.entries(normalized.equipment).map(([key, value]) => [
+            key, value || previous.equipment?.[key as keyof ServiceOrderEquipment],
+          ])) as ServiceOrderEquipment,
+        } : {}),
+        ...(keepDetailedQuestionnaire ? {
+          questionnaireId: previous.questionnaireId,
+          questionnaireTitle: previous.questionnaireTitle,
+          questionnaireResponses: previous.questionnaireResponses,
+          closingQuestions: previous.closingQuestions,
+        } : {}),
+        statusId: previous.statusId,
+        status: previous.status,
+        statusStartedAt: previous.statusStartedAt,
+        detailsLoaded: previous.detailsLoaded === true,
+        questionnaireResolved: previous.questionnaireResolved === true,
+      };
     });
   });
 }
