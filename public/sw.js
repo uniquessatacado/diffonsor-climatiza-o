@@ -81,6 +81,31 @@ async function deleteAction(actionId) {
   });
 }
 
+async function acknowledgeAction(action) {
+  const db = await openDb();
+  const draftKey = action.type === "finish_order" ? action.localMetadata?.draftKey : undefined;
+
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction([queueStore, settingsStore], "readwrite");
+    transaction.objectStore(queueStore).delete(action.id);
+
+    if (typeof draftKey === "string" && draftKey.startsWith("diffonso.closingDraft.v2.")) {
+      transaction.objectStore(settingsStore).delete(draftKey);
+    }
+
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+
+  if (action.type === "finish_order") {
+    await deleteStatusActionsForOrder(
+      getPayloadValue(action.payload, "id_ordem_servico") || action.orderId,
+      getPayloadValue(action.payload, "id_ordem_servico_equipamento"),
+    );
+  }
+}
+
 function getPayloadValue(payload, key) {
   if (!payload || typeof payload !== "object") {
     return "";
@@ -102,14 +127,19 @@ function isAlreadyAppliedError(message) {
   );
 }
 
-async function deleteStatusActionsForOrder(orderCode) {
+async function deleteStatusActionsForOrder(orderCode, equipmentOrderId = "") {
   const actions = await getAllActions();
 
   await Promise.all(
     actions
       .filter((action) => {
         const actionOrderCode = getPayloadValue(action.payload, "id_ordem_servico") || action.orderId;
-        return action.type === "status_change" && String(actionOrderCode) === String(orderCode);
+        const actionEquipmentOrderId = getPayloadValue(action.payload, "id_ordem_servico_equipamento");
+        const sameTarget = equipmentOrderId
+          ? actionEquipmentOrderId === equipmentOrderId
+          : !actionEquipmentOrderId;
+
+        return action.type === "status_change" && String(actionOrderCode) === String(orderCode) && sameTarget;
       })
       .map((action) => deleteAction(action.id)),
   );
@@ -143,6 +173,8 @@ function collectMediaRefs(value, refs = new Map(), context = {}) {
   };
 
   if (
+    value.source !== "remote" &&
+    ![value.url, value.uri].some((item) => typeof item === "string" && /^https?:\/\//i.test(item)) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     typeof value.createdAt === "string" &&
@@ -157,6 +189,29 @@ function collectMediaRefs(value, refs = new Map(), context = {}) {
   }
 
   Object.values(value).forEach((item) => collectMediaRefs(item, refs, nextContext));
+  return refs;
+}
+
+function collectRemoteMedia(value, refs = new Map()) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectRemoteMedia(item, refs));
+    return refs;
+  }
+
+  if (!value || typeof value !== "object") {
+    return refs;
+  }
+
+  const url = [value.url, value.uri].find((item) => typeof item === "string" && /^https?:\/\//i.test(item));
+
+  if (value.source === "remote" || url) {
+    const id = value.id_midia ?? value.id;
+    const key = id != null ? `id:${String(id)}` : `url:${String(url)}`;
+    refs.set(key, value);
+    return refs;
+  }
+
+  Object.values(value).forEach((item) => collectRemoteMedia(item, refs));
   return refs;
 }
 
@@ -317,10 +372,27 @@ async function syncQueue() {
         continue;
       }
 
+      const payload = action.payload ?? {};
+      const signature = payload.assinatura;
+      let signatureBlob = null;
+
+      if (typeof signature === "string" && /^data:image\/[\w.+-]+;base64,/i.test(signature)) {
+        try {
+          signatureBlob = dataUrlToBlob(signature);
+        } catch {
+          // Keep malformed signatures pending; never send an unsigned finalization.
+        }
+      }
+
+      if (action.type === "finish_order" && !signatureBlob?.size) {
+        await putAction({ ...action, attempts: (action.attempts ?? 0) + 1 });
+        continue;
+      }
+
       const formData = new FormData();
       const mediaRefs = Array.from(collectMediaRefs(action.payload).values());
       const fileMeta = [];
-      const payload = action.payload ?? {};
+      let missingMedia = "";
 
       formData.append("dados", JSON.stringify(payload));
       formData.append("finalizacao", JSON.stringify(payload));
@@ -331,41 +403,36 @@ async function syncQueue() {
         }
       });
 
-      const signature = payload.assinatura;
-
-      if (typeof signature === "string" && signature.startsWith("data:image/")) {
-        const signatureBlob = dataUrlToBlob(signature);
-
-        if (signatureBlob) {
-          formData.append("assinatura", signatureBlob, "assinatura.png");
-          formData.append(
-            "assinaturaMeta",
-            JSON.stringify({
-              campo: "assinatura",
-              id: "assinatura",
-              nome: "assinatura.png",
-              tipo: signatureBlob.type,
-              tamanho: signatureBlob.size,
-            }),
-          );
-          formData.append(
-            "fileMetaAssinatura",
-            JSON.stringify({
-              campo: "assinatura",
-              id: "assinatura",
-              nome: "assinatura.png",
-              tipo: signatureBlob.type,
-              tamanho: signatureBlob.size,
-            }),
-          );
-        }
+      if (signatureBlob) {
+        formData.append("assinatura", signatureBlob, "assinatura.png");
+        formData.append(
+          "assinaturaMeta",
+          JSON.stringify({
+            campo: "assinatura",
+            id: "assinatura",
+            nome: "assinatura.png",
+            tipo: signatureBlob.type,
+            tamanho: signatureBlob.size,
+          }),
+        );
+        formData.append(
+          "fileMetaAssinatura",
+          JSON.stringify({
+            campo: "assinatura",
+            id: "assinatura",
+            nome: "assinatura.png",
+            tipo: signatureBlob.type,
+            tamanho: signatureBlob.size,
+          }),
+        );
       }
 
       for (const [index, mediaRef] of mediaRefs.entries()) {
         const media = await getMedia(mediaRef.id);
 
         if (!media) {
-          continue;
+          missingMedia = mediaRef.name;
+          break;
         }
 
         formData.append("midias[]", media.blob, media.name);
@@ -381,6 +448,11 @@ async function syncQueue() {
           tamanho: media.size,
           createdAt: media.createdAt,
         });
+      }
+
+      if (missingMedia) {
+        await putAction({ ...action, attempts: (action.attempts ?? 0) + 1 });
+        continue;
       }
 
       formData.append("fileMeta", JSON.stringify(fileMeta));
@@ -411,7 +483,7 @@ async function syncQueue() {
           successValue === "true");
 
       if (ok) {
-        await deleteAction(action.id);
+        await acknowledgeAction(action);
       } else {
         const message =
           typeof data.dados === "string"
@@ -423,7 +495,7 @@ async function syncQueue() {
           const mediaById = new Map(mediaPayloads.map((media) => [String(media.id), media]));
           const payloadWithMedia = {
             ...attachMediaPayloads(payload, mediaById),
-            midias: mediaPayloads,
+            midias: [...collectRemoteMedia(payload).values(), ...mediaPayloads],
           };
           const jsonResponse = await fetch(targetUrl, {
             method: "POST",
@@ -452,28 +524,17 @@ async function syncQueue() {
               jsonSuccessValue === "true");
 
           if (jsonOk) {
-            await deleteAction(action.id);
-            if (action.type === "finish_order") {
-              await deleteStatusActionsForOrder(String(payload.id_ordem_servico ?? action.orderId));
-            }
+            await acknowledgeAction(action);
           } else {
             const jsonMessage =
               typeof jsonData.dados === "string"
                 ? jsonData.dados
                 : jsonData.mensagem ?? jsonData.message ?? "";
 
-            if (isAlreadyAppliedError(jsonMessage)) {
-              await deleteAction(action.id);
-            } else {
-              await putAction({ ...action, attempts: (action.attempts ?? 0) + 1 });
-            }
-          }
-        } else {
-          if (isAlreadyAppliedError(message)) {
-            await deleteAction(action.id);
-          } else {
             await putAction({ ...action, attempts: (action.attempts ?? 0) + 1 });
           }
+        } else {
+          await putAction({ ...action, attempts: (action.attempts ?? 0) + 1 });
         }
       }
     } catch {

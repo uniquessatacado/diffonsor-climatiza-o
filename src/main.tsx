@@ -30,7 +30,7 @@ import {
 import { isTestLoginEmail, login, requestPasswordReset } from "./services/auth";
 import {
   fetchClosingQuestions,
-  fetchServiceOrderDetails,
+  fetchServiceOrderDetailOrders,
   fetchServiceOrders,
   getTestServiceOrders,
   serviceOrderStatuses,
@@ -58,13 +58,30 @@ import {
 } from "./services/mediaStore";
 import { isApiNetworkError } from "./services/api";
 import { addNetworkListener, isDeviceOnline, offlineNotice } from "./services/connectivity";
+import {
+  getEquipmentGroupId,
+  groupServiceOrders,
+  type ServiceOrderGroup,
+} from "./services/serviceOrderGroups";
 import { EquipmentRegistrationScreen } from "./components/EquipmentRegistrationScreen";
+import {
+  readClosingDraft,
+  writeClosingDraft,
+  removeClosingDraft,
+  mergeClosingAnswers,
+  mergeMediaAnswers,
+  readBackendClosingAnswers,
+  getClosingDraftKey as getScopedClosingDraftKey,
+  createClosingDraftSnapshot,
+  getClosingMediaIdentityKeys,
+  type ClosingDraft,
+  type ClosingDraftScope,
+} from "./services/closingDrafts";
 import "./styles.css";
 
 const rememberedLoginKey = "diffonso.rememberedLogin";
 const sessionKey = "diffonso.session";
 const ordersCacheKey = "diffonso.cachedOrders";
-const legacyPendingClearKey = "diffonso.legacy-pending-cleared.v6";
 const testOrderId = "teste-1";
 const maxMediaBytes = 12 * 1024 * 1024;
 const maxTotalMediaBytes = 12 * 1024 * 1024;
@@ -199,6 +216,39 @@ function preserveStatusTimers(freshOrders: ServiceOrder[], previousOrders: Servi
   });
 }
 
+function mergeOrderSummaries(freshOrders: ServiceOrder[], previousOrders: ServiceOrder[], pending: PendingActionSummary[]) {
+  const previousById = new Map(previousOrders.map((order) => [order.id, order]));
+  const incomingOrders = freshOrders.flatMap((summary) => {
+    const raw = summary.raw && typeof summary.raw === "object" ? summary.raw as Record<string, unknown> : {};
+    const omitsEquipment = !Object.prototype.hasOwnProperty.call(raw, "equipamentos") && !Object.prototype.hasOwnProperty.call(raw, "equipamento");
+    const detailedItems = !summary.detailsLoaded && !summary.equipment && omitsEquipment
+      ? previousOrders.filter((previous) => previous.detailsLoaded && previous.equipment && previous.apiOrderCode === summary.apiOrderCode)
+      : [];
+    return detailedItems.length
+      ? detailedItems.map((previous) => ({ ...previous, client: summary.client, clientId: summary.clientId, address: summary.address }))
+      : [summary];
+  });
+  return preserveStatusTimers(incomingOrders.map((summary) => {
+    const previous = previousById.get(summary.id);
+    const sameEquipment = Boolean(summary.equipment) === Boolean(previous?.equipment)
+      && summary.equipmentOrderId === previous?.equipmentOrderId
+      && summary.equipment?.clientEquipmentId === previous?.equipment?.clientEquipmentId;
+    const sameQuestionnaire = !summary.questionnaireId || summary.questionnaireId === previous?.questionnaireId;
+    // A list refresh is not a detailed questionnaire response.
+    const order = !summary.detailsLoaded && previous?.detailsLoaded && sameEquipment && sameQuestionnaire
+      ? { ...summary, equipment: previous.equipment, service: previous.service, serviceId: previous.serviceId,
+          questionnaireId: previous.questionnaireId, questionnaireTitle: previous.questionnaireTitle,
+          closingQuestions: previous.closingQuestions, questionnaireResponses: previous.questionnaireResponses,
+          questionnaireSource: previous.questionnaireSource, questionnaireResolved: true, detailsLoaded: true }
+      : summary;
+    const action = pending.filter((item) => item.orderId === order.id)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-1)[0];
+    return action?.statusId
+      ? { ...order, statusId: action.statusId, status: serviceOrderStatuses[action.statusId], statusStartedAt: previous?.statusStartedAt ?? action.createdAt }
+      : order;
+  }), previousOrders);
+}
+
 function parseDatetimeAnswer(value: string | string[] | undefined | null) {
   if (Array.isArray(value) || value == null) {
     return { date: "", time: "" };
@@ -254,26 +304,6 @@ function readSavedSession() {
     localStorage.removeItem(sessionKey);
     sessionStorage.removeItem(sessionKey);
     return null;
-  }
-}
-
-function cleanupLargeDrafts() {
-  try {
-    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
-      const key = localStorage.key(index);
-
-      if (!key?.startsWith("diffonso.closingDraft.")) {
-        continue;
-      }
-
-      const value = localStorage.getItem(key);
-
-      if (value && value.length > 500_000) {
-        localStorage.removeItem(key);
-      }
-    }
-  } catch {
-    // If storage is blocked, the app still works with in-memory form state.
   }
 }
 
@@ -362,6 +392,18 @@ function getOrdersCacheKey(session?: SavedSession | null) {
   const userKey = isTestSession(session) ? "teste" : String(session?.data?.id ?? session?.email ?? "anonimo");
   return `${ordersCacheKey}.${userKey}`;
 }
+
+function getDraftScope(order: ServiceOrder): ClosingDraftScope {
+  const session = readSavedSession();
+  return {
+    userId: isTestSession(session) ? "teste" : String(getCollaboratorId(session) || session?.email || "anonimo"),
+    orderId: order.apiId ?? order.apiOrderCode,
+    equipmentOrderId: order.equipmentOrderId ?? (order.equipment ? `equipment-${order.id}` : undefined),
+    questionnaireId: order.questionnaireId,
+  };
+}
+
+type ClosingContext = { order: ServiceOrder; scope: ClosingDraftScope; key: string };
 
 async function readOrdersCache(session?: SavedSession | null) {
   const key = getOrdersCacheKey(session);
@@ -513,10 +555,13 @@ type MediaAnswer = SavedMedia & {
   previewUrl?: string;
   previewDataUrl?: string;
   status?: "encoding" | "ready" | "error";
+  source?: "remote";
+  url?: string;
+  remotePayload?: Record<string, unknown>;
 };
 
 function inferMediaType(name: string) {
-  const extension = name.split(".").pop()?.toLowerCase() ?? "";
+  const extension = name.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? "";
 
   if (["jpg", "jpeg", "png", "webp", "gif", "heic", "heif"].includes(extension)) {
     return "image/*";
@@ -535,9 +580,10 @@ function normalizeStoredMedia(value: unknown): MediaAnswer | null {
   }
 
   const record = value as Record<string, unknown>;
-  const id = typeof record.id === "string" ? record.id.trim() : "";
-  const name = typeof record.name === "string" && record.name.trim() ? record.name : "midia";
-  const size = Number(record.size);
+  const remoteUrl = [record.url, record.uri].find((item): item is string => typeof item === "string" && /^https?:\/\//i.test(item));
+  const id = String(record.id ?? record.id_midia ?? remoteUrl ?? "").trim();
+  const name = String(record.name || record.nome || "midia");
+  const size = Number(record.size ?? record.tamanho ?? (remoteUrl ? 0 : NaN));
 
   if (!id || !Number.isFinite(size) || size < 0) {
     return null;
@@ -546,12 +592,16 @@ function normalizeStoredMedia(value: unknown): MediaAnswer | null {
   return {
     id,
     name,
-    type: typeof record.type === "string" && record.type.trim() ? record.type : inferMediaType(name),
+    type: typeof record.type === "string" && record.type.trim() ? record.type
+      : typeof record.tipo === "string" && record.tipo.trim() ? record.tipo : inferMediaType(remoteUrl || name),
     size,
     createdAt:
       typeof record.createdAt === "string" && record.createdAt
         ? record.createdAt
         : new Date(0).toISOString(),
+    ...(remoteUrl ? { source: "remote" as const, url: remoteUrl,
+      remotePayload: record.remotePayload && typeof record.remotePayload === "object"
+        ? record.remotePayload as Record<string, unknown> : record } : {}),
     ...(typeof record.previewUrl === "string" ? { previewUrl: record.previewUrl } : {}),
     ...(typeof record.previewDataUrl === "string" ? { previewDataUrl: record.previewDataUrl } : {}),
     ...(record.status === "encoding" || record.status === "ready" || record.status === "error"
@@ -568,128 +618,19 @@ function parseStoredMedia(value: unknown) {
   }
 }
 
-function isMediaAnswer(value: string | string[]) {
-  return Array.isArray(value) && value.some((item) => Boolean(parseStoredMedia(item)));
-}
-
-function stripMediaPreviewFields(value: string | string[]) {
-  if (!Array.isArray(value)) {
-    return value;
-  }
-
-  return value.map((item) => {
-    const media = parseStoredMedia(item);
-
-    if (!media) {
-      return item;
-    }
-
-    const {
-      previewUrl: _previewUrl,
-      previewDataUrl: _previewDataUrl,
-      status: _status,
-      ...storedMedia
-    } = media;
-
-    return JSON.stringify(storedMedia);
-  });
-}
-
-function prepareClosingDraftForStorage(answers: Record<string, string | string[]>) {
-  return Object.fromEntries(
-    Object.entries(answers).map(([questionId, value]) => [
-      questionId,
-      isMediaAnswer(value) ? stripMediaPreviewFields(value) : value,
-    ]),
-  );
-}
-
-function saveClosingDraft(orderId: string, answers: Record<string, string | string[]>) {
-  localStorage.setItem(
-    getClosingDraftKey(orderId),
-    JSON.stringify(prepareClosingDraftForStorage(answers)),
-  );
-}
-
-async function restoreClosingDraft(
-  savedDraft: string | null,
-  questions: ClosingQuestion[],
-): Promise<{ answers: Record<string, string | string[]>; removedMedia: number }> {
-  if (!savedDraft) {
-    return { answers: {}, removedMedia: 0 };
-  }
-
-  let parsed: unknown;
-
+function readLegacyClosingDraft(orderId: string): Record<string, string | string[]> | null {
   try {
-    parsed = JSON.parse(savedDraft);
+    const saved = localStorage.getItem(getClosingDraftKey(orderId));
+    if (!saved) return null;
+    const parsed: unknown = JSON.parse(saved);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return Object.fromEntries(Object.entries(parsed).filter(([, value]) =>
+      typeof value === "string" || (Array.isArray(value) && value.every((item) => typeof item === "string")),
+    ));
   } catch {
-    return { answers: {}, removedMedia: 0 };
+    // Preserve the original legacy record if it cannot be read.
+    return null;
   }
-
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { answers: {}, removedMedia: 0 };
-  }
-
-  const storedAnswers = parsed as Record<string, unknown>;
-  const answers: Record<string, string | string[]> = {};
-  let removedMedia = 0;
-
-  for (const question of questions) {
-    const value = storedAnswers[question.id];
-
-    if (question.step === "media") {
-      const restoredMedia: string[] = [];
-
-      for (const item of Array.isArray(value) ? value : []) {
-        const media = parseStoredMedia(item);
-
-        if (!media) {
-          removedMedia += 1;
-          continue;
-        }
-
-        try {
-          const stored = await getMedia(media.id);
-
-          if (!stored?.blob || stored.blob.size <= 0) {
-            removedMedia += 1;
-            continue;
-          }
-
-          restoredMedia.push(
-            JSON.stringify({
-              id: stored.id,
-              name: stored.name || media.name,
-              type: stored.type || media.type || inferMediaType(stored.name || media.name),
-              size: stored.blob.size,
-              createdAt: stored.createdAt || media.createdAt,
-            } satisfies SavedMedia),
-          );
-        } catch {
-          removedMedia += 1;
-        }
-      }
-
-      answers[question.id] = restoredMedia;
-      continue;
-    }
-
-    if (question.step === "checkbox") {
-      answers[question.id] = Array.isArray(value)
-        ? value
-            .filter((item) => typeof item === "string" || typeof item === "number")
-            .map(String)
-        : [];
-      continue;
-    }
-
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      answers[question.id] = String(value);
-    }
-  }
-
-  return { answers, removedMedia };
 }
 
 function releaseMediaPreviewUrls(answers: Record<string, string | string[]>) {
@@ -714,22 +655,24 @@ function MediaPreview({ item, onRemove }: { item: string; onRemove: () => void }
   const [restoredPreviewUrl, setRestoredPreviewUrl] = useState("");
 
   useEffect(() => {
-    if (!media?.id || media.previewUrl) {
+    if (!media?.id || media.previewUrl || media.source === "remote") {
       return;
     }
 
     let objectUrl = "";
+    let disposed = false;
 
     void getMedia(media.id).then((stored) => {
-      if (!stored) {
+      if (!stored || disposed) {
         return;
       }
 
       objectUrl = URL.createObjectURL(stored.blob);
       setRestoredPreviewUrl(objectUrl);
-    });
+    }).catch(() => { if (!disposed) setPreviewFailed(true); });
 
     return () => {
+      disposed = true;
       if (objectUrl) {
         URL.revokeObjectURL(objectUrl);
       }
@@ -740,7 +683,7 @@ function MediaPreview({ item, onRemove }: { item: string; onRemove: () => void }
     return null;
   }
 
-  const previewSource = media.previewUrl || restoredPreviewUrl || media.previewDataUrl;
+  const previewSource = media.url || media.previewUrl || restoredPreviewUrl || media.previewDataUrl;
   const mediaType = media.type || inferMediaType(media.name);
   const canShowImage = mediaType.startsWith("image/") && previewSource && !previewFailed;
   const canShowVideo = mediaType.startsWith("video/") && previewSource && !previewFailed;
@@ -780,7 +723,7 @@ function MediaPreview({ item, onRemove }: { item: string; onRemove: () => void }
 type ClosingModalProps = {
   answers: Record<string, string | string[]>;
   currentStep: number;
-  onAnswer: (questionId: string, value: string | string[]) => void;
+  onAnswer: (questionId: string, value: string | string[], append?: boolean) => void;
   onBack: () => void;
   onClose: () => void;
   onFinish: () => void;
@@ -892,7 +835,14 @@ function ClosingModal({
     const candidates = fileList.filter(
       (file) => file.size <= (isImageFile(file) ? maxImageSourceBytes : maxMediaBytes),
     );
-    const preparedFiles = await Promise.all(candidates.map((file) => optimizeImageForUpload(file)));
+    let preparedFiles: File[];
+    try {
+      preparedFiles = await Promise.all(candidates.map((file) => optimizeImageForUpload(file)));
+    } catch {
+      setMediaError("Não foi possível preparar esta mídia. As fotos anteriores continuam salvas.");
+      setPreparingMedia(false);
+      return;
+    }
     const tooLargeAfterOptimization = preparedFiles.filter((file) => file.size > maxMediaBytes);
     const current = Array.isArray(answerRef.current) ? answerRef.current : [];
     const currentBytes = Object.entries(answers).reduce((total, [answerId, storedAnswer]) => {
@@ -903,7 +853,10 @@ function ClosingModal({
             ? storedAnswer
             : [];
 
-      return total + mediaItems.reduce((subtotal, item) => subtotal + (parseStoredMedia(item)?.size ?? 0), 0);
+      return total + mediaItems.reduce((subtotal, item) => {
+        const media = parseStoredMedia(item);
+        return subtotal + (media?.source === "remote" ? 0 : media?.size ?? 0);
+      }, 0);
     }, 0);
     let selectedBytes = currentBytes;
     const acceptedFiles: File[] = [];
@@ -952,17 +905,16 @@ function ClosingModal({
     try {
       await savePreparedMediaFiles(prepared);
       const latest = Array.isArray(answerRef.current) ? answerRef.current : [];
-      const nextMedia = prepared.map(({ metadata, file }) =>
+      const nextMedia = prepared.map(({ metadata }) =>
         JSON.stringify({
           ...metadata,
-          previewUrl: URL.createObjectURL(file),
           status: "ready",
         } satisfies MediaAnswer),
       );
-      const next = [...latest, ...nextMedia];
+      const next = mergeMediaAnswers(latest, nextMedia);
 
       answerRef.current = next;
-      onAnswer(question.id, next);
+      onAnswer(question.id, nextMedia, true);
     } catch {
       await Promise.all(prepared.map((item) => deleteMedia(item.metadata.id).catch(() => undefined)));
       setMediaError("Não foi possível guardar esta mídia no aparelho. Selecione o arquivo novamente.");
@@ -978,9 +930,8 @@ function ClosingModal({
       URL.revokeObjectURL(media.previewUrl);
     }
 
-    if (media?.id) {
-      void deleteMedia(media.id);
-    }
+    // Keep the blob while an offline report may still reference it. The draft
+    // records the explicit removal, so navigation cannot bring the photo back.
 
     const latest = Array.isArray(answerRef.current) ? answerRef.current : [];
     const next = latest.filter((current) => current !== item);
@@ -1009,7 +960,7 @@ function ClosingModal({
               </span>
               <h2 id="closing-title">{question.label}</h2>
             </div>
-            <button type="button" className="icon-button" onClick={onClose} disabled={submitting} aria-label="Fechar" title="Fechar">
+            <button type="button" className="icon-button" onClick={onClose} disabled={submitting || preparingMedia} aria-label="Fechar" title="Fechar">
               <X size={22} />
             </button>
           </header>
@@ -1103,7 +1054,7 @@ function ClosingModal({
                   {answer.map((item) => (
                     <MediaPreview
                       item={item}
-                      key={parseStoredMedia(item)?.id ?? item}
+                      key={getClosingMediaIdentityKeys(item).join("|") || item}
                       onRemove={() => removeMedia(item)}
                     />
                   ))}
@@ -1249,6 +1200,8 @@ function SignaturePad({ value, onChange }: SignaturePadProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const drawingRef = useRef(false);
+  const hasStrokeRef = useRef(false);
+  const lastPointRef = useRef({ x: 0, y: 0 });
   const valueRef = useRef(value);
   const [isLandscape, setIsLandscape] = useState(
     window.matchMedia("(orientation: landscape)").matches,
@@ -1321,8 +1274,10 @@ function SignaturePad({ value, onChange }: SignaturePadProps) {
     }
 
     drawingRef.current = true;
+    hasStrokeRef.current = false;
     canvas.setPointerCapture(event.pointerId);
     const point = getPoint(event);
+    lastPointRef.current = point;
     context.beginPath();
     context.moveTo(point.x, point.y);
   }
@@ -1337,6 +1292,9 @@ function SignaturePad({ value, onChange }: SignaturePadProps) {
     }
 
     const point = getPoint(event);
+    if (point.x === lastPointRef.current.x && point.y === lastPointRef.current.y) return;
+    lastPointRef.current = point;
+    hasStrokeRef.current = true;
     context.lineTo(point.x, point.y);
     context.stroke();
   }
@@ -1349,7 +1307,7 @@ function SignaturePad({ value, onChange }: SignaturePadProps) {
     drawingRef.current = false;
     const canvas = canvasRef.current;
 
-    if (canvas) {
+    if (canvas && hasStrokeRef.current) {
       onChange(canvas.toDataURL("image/png"));
     }
   }
@@ -1441,6 +1399,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
   const [ordersLoading, setOrdersLoading] = useState(false);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState("");
+  const [resolvedDetailRoute, setResolvedDetailRoute] = useState<string | null>(null);
   const [orders, setOrders] = useState<ServiceOrder[]>([]);
   const [statusFilter, setStatusFilter] = useState<number | null>(null);
   const [lastCheckedAt, setLastCheckedAt] = useState<Date | null>(null);
@@ -1451,6 +1412,16 @@ function App() {
   const [syncMessage, setSyncMessage] = useState("");
   const [_elapsedTicker, setElapsedTicker] = useState(0);
   const [closingOrder, setClosingOrder] = useState(false);
+  const [closingLoading, setClosingLoading] = useState(false);
+  const [closingContext, setClosingContext] = useState<ClosingContext | null>(null);
+  const activeClosingContext = useRef<ClosingContext | null>(null);
+  activeClosingContext.current = closingOrder ? closingContext : null;
+  const closingDraftsByScope = useRef(new Map<string, ClosingDraft>());
+  const detailRequests = useRef(new Map<string, Promise<ServiceOrder[]>>());
+  const activeRoute = useRef(route);
+  activeRoute.current = route;
+  const ordersRef = useRef(orders);
+  ordersRef.current = orders;
   const [suspendingOrder, setSuspendingOrder] = useState(false);
   const [closingStep, setClosingStep] = useState(0);
   const [closingQuestions, setClosingQuestions] = useState<ClosingQuestion[]>([]);
@@ -1467,16 +1438,34 @@ function App() {
     () => orders.find((order) => order.id === route.orderId) ?? null,
     [orders, route.orderId],
   );
+  const orderGroups = useMemo(
+    () => groupServiceOrders(orders, serviceOrderStatuses),
+    [orders],
+  );
+  const homeOrderGroups = useMemo(
+    () => orderGroups.filter((group) => !group.isEquipmentBased || group.representative.statusId !== 5),
+    [orderGroups],
+  );
+  const selectedOrderGroup = useMemo(
+    () => orderGroups.find((group) => group.id === route.orderId) ?? null,
+    [orderGroups, route.orderId],
+  );
   const statusCounts = useMemo(
     () =>
       Object.fromEntries(
-        dashboardStatuses.map(({ id }) => [id, orders.filter((order) => order.statusId === id).length]),
+        dashboardStatuses.map(({ id }) => [
+          id,
+          homeOrderGroups.filter((group) => group.representative.statusId === id).length,
+        ]),
       ) as Record<number, number>,
-    [orders],
+    [homeOrderGroups],
   );
-  const visibleOrders = useMemo(
-    () => (statusFilter === null ? orders : orders.filter((order) => order.statusId === statusFilter)),
-    [orders, statusFilter],
+  const visibleOrderGroups = useMemo(
+    () =>
+      statusFilter === null
+        ? homeOrderGroups
+        : homeOrderGroups.filter((group) => group.representative.statusId === statusFilter),
+    [homeOrderGroups, statusFilter],
   );
   const canSubmit = useMemo(() => email.trim() !== "" && password.trim() !== "", [email, password]);
 
@@ -1486,8 +1475,6 @@ function App() {
   }
 
   useEffect(() => {
-    cleanupLargeDrafts();
-
     function handleRouteChange() {
       setRoute(routeFromPath(window.location.pathname));
     }
@@ -1498,6 +1485,9 @@ function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
+    setClosingOrder(false);
+    setClosingContext(null);
+    setSuspendingOrder(false);
   }, [route.page, route.orderId]);
 
   useEffect(() => {
@@ -1518,7 +1508,7 @@ function App() {
     const session = readSavedSession();
 
     void readOrdersCache(session).then((cached) => {
-      if (cached?.orders.length) {
+      if (cached?.orders.length && getOrdersCacheKey(readSavedSession()) === getOrdersCacheKey(session)) {
         setOrders(cached.orders);
       }
     });
@@ -1535,23 +1525,40 @@ function App() {
   useEffect(() => {
     let removeNetworkListener: (() => Promise<void>) | undefined;
 
-    async function trySync() {
+    async function trySync(showErrors = true) {
       const result = await syncPendingActions();
       setPendingSyncCount(result.pending);
 
       if (result.offline) {
         showOfflineNotice();
-        return;
+        return result;
       }
 
       if (result.error) {
-        setErrorModal(result.error);
+        if (showErrors) {
+          setErrorModal(result.error);
+        }
+        setSyncMessage("Há relatório(s) pendente(s). O aplicativo tentará enviar novamente.");
       }
 
       if (result.synced > 0) {
         setSyncMessage(`${result.synced} alteração(ões) sincronizada(s).`);
       } else if (result.missingUrl && result.pending > 0) {
         setSyncMessage("Pendências salvas. Configure a URL da API para sincronizar.");
+      }
+
+      return result;
+    }
+
+    async function retryPendingSync() {
+      if ((await getPendingActionsCount()) === 0 || !(await isDeviceOnline())) {
+        return;
+      }
+
+      const result = await trySync(false);
+
+      if (result.synced > 0) {
+        await loadServiceOrders();
       }
     }
 
@@ -1568,6 +1575,16 @@ function App() {
       })();
     }
 
+    function handleAppResume() {
+      if (document.visibilityState === "visible") {
+        void retryPendingSync();
+      }
+    }
+
+    window.addEventListener("focus", handleAppResume);
+    document.addEventListener("visibilitychange", handleAppResume);
+    const retryTimer = window.setInterval(() => void retryPendingSync(), 30000);
+
     void (async () => {
       await setupOfflineSync();
       removeNetworkListener = await addNetworkListener(handleConnectivityChange);
@@ -1579,14 +1596,6 @@ function App() {
         showOfflineNotice();
       }
 
-      if (!localStorage.getItem(legacyPendingClearKey)) {
-        await clearPendingActions();
-        localStorage.setItem(legacyPendingClearKey, "1");
-        if (connected) {
-          setSyncMessage("Pendencias antigas limpas.");
-        }
-      }
-
       setPendingSyncCount(await getPendingActionsCount());
       if (connected) {
         await trySync();
@@ -1594,6 +1603,9 @@ function App() {
     })();
 
     return () => {
+      window.clearInterval(retryTimer);
+      window.removeEventListener("focus", handleAppResume);
+      document.removeEventListener("visibilitychange", handleAppResume);
       void removeNetworkListener?.();
     };
   }, []);
@@ -1635,18 +1647,32 @@ function App() {
       return;
     }
 
-    if (isLoggedIn && (route.page === "orders" || route.page === "order")) {
+    if (isLoggedIn && (route.page === "orders" || (route.page === "order" && orders.length === 0))) {
       void loadServiceOrders();
     }
   }, [isLoggedIn, route.page]);
 
   useEffect(() => {
-    if (!isLoggedIn || route.page !== "order" || !route.orderId) {
+    if (!isLoggedIn || route.page !== "order" || !route.orderId || (!selectedOrder && !selectedOrderGroup)) {
       return;
     }
 
-    void loadServiceOrderDetails(route.orderId);
-  }, [isLoggedIn, route.page, route.orderId, selectedOrder?.apiOrderCode]);
+    let cancelled = false;
+    const routeId = route.orderId;
+    setDetailsLoading(true);
+    setResolvedDetailRoute(null);
+    setDetailsError("");
+    void loadServiceOrderDetails(routeId).then((result) => {
+      if (!cancelled) {
+        setResolvedDetailRoute(result ? routeId : null);
+      }
+    }).catch((error: unknown) => {
+      if (!cancelled) setDetailsError(error instanceof Error ? error.message : "Não foi possível carregar os detalhes.");
+    }).finally(() => {
+      if (!cancelled) setDetailsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [isLoggedIn, route.page, route.orderId, selectedOrder?.apiOrderCode, selectedOrderGroup?.representative.apiOrderCode]);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1744,8 +1770,10 @@ function App() {
       setIsOnline(true);
       const serviceOrders = await fetchServiceOrders(idColaborador);
       const cached = await readOrdersCache(session);
+      const pending = await getPendingActions();
+      if (getOrdersCacheKey(readSavedSession()) !== getOrdersCacheKey(session)) return;
 
-      setOrders((current) => preserveStatusTimers(serviceOrders, current.length ? current : (cached?.orders ?? [])));
+      setOrders((current) => mergeOrderSummaries(serviceOrders, current.length ? current : (cached?.orders ?? []), pending));
       setLastCheckedAt(new Date());
       setSyncMessage((current) => (current === offlineNotice ? "" : current));
     } catch (error) {
@@ -1780,47 +1808,52 @@ function App() {
   async function loadServiceOrderDetails(orderId: string) {
     const session = readSavedSession();
     const idColaborador = getCollaboratorId(session);
-
-    if (isTestSession(session) || !idColaborador) {
-      return;
-    }
-
-    const currentOrder = orders.find((order) => order.id === orderId);
-    const idOrdemServico = currentOrder?.apiOrderCode ?? currentOrder?.number.replace(/\D/g, "") ?? orderId;
-
-    if (!(await isDeviceOnline())) {
+    const currentOrders = ordersRef.current;
+    const currentOrder = currentOrders.find((order) => order.id === orderId)
+      ?? groupServiceOrders(currentOrders, serviceOrderStatuses).find((group) => group.id === orderId)?.representative;
+    if (!currentOrder) return null;
+    if (isTestSession(session)) return [currentOrder];
+    if (!idColaborador) return null;
+    const idOrdemServico = currentOrder.apiOrderCode;
+    const cachedDetails = currentOrders.filter((order) => order.apiOrderCode === idOrdemServico && order.detailsLoaded);
+    const useOfflineDetails = () => {
       showOfflineNotice();
-      return;
+      const requiredOrders = currentOrders.filter((order) => order.apiOrderCode === idOrdemServico && (orderId !== currentOrder.id || order.id === orderId));
+      if (requiredOrders.length && requiredOrders.every((order) => cachedDetails.some((cached) => cached.id === order.id))) return cachedDetails;
+      throw new Error("Conecte-se à internet para carregar os detalhes desta ordem pela primeira vez. Os rascunhos existentes continuam salvos.");
+    };
+    if (!(await isDeviceOnline())) return useOfflineDetails();
+    const requestKey = `${idColaborador}:${idOrdemServico}`;
+    let request = detailRequests.current.get(requestKey);
+    if (!request) {
+      request = fetchServiceOrderDetailOrders(idColaborador, idOrdemServico);
+      detailRequests.current.set(requestKey, request);
     }
-
     try {
-      const freshOrder = await fetchServiceOrderDetails(idColaborador, idOrdemServico);
-
-      if (!freshOrder) {
-        return;
-      }
-
-      setOrders((current) =>
-        current.map((order) =>
-          order.id === orderId ? preserveStatusTimers([freshOrder], [order])[0] : order,
-        ),
-      );
+      const freshOrders = await request;
+      if (!freshOrders.length) throw new Error("A API não retornou os detalhes desta ordem.");
+      if (getCollaboratorId(readSavedSession()) !== idColaborador) return null;
+      const pending = await getPendingActions();
+      const detailedOrders = mergeOrderSummaries(freshOrders, ordersRef.current, pending);
+      setOrders((current) => [
+        ...current.filter((order) => order.apiOrderCode !== idOrdemServico),
+        ...detailedOrders,
+      ]);
       setLastCheckedAt(new Date());
-    } catch (error) {
-      if (isApiNetworkError(error) || !(await isDeviceOnline())) {
-        showOfflineNotice();
-        return;
+      if (activeRoute.current.orderId === orderId && !detailedOrders.some((order) => order.id === orderId)) {
+        const group = groupServiceOrders(detailedOrders, serviceOrderStatuses)[0];
+        if (group && group.id !== orderId) navigateTo(`/ordem/${group.id}`);
       }
-
-      const errorMessage =
-        error instanceof Error ? error.message : "Não foi possível atualizar os dados da ordem de serviço.";
-      setMessageType("error");
-      setMessage(errorMessage);
-      setErrorModal(errorMessage);
+      return detailedOrders;
+    } catch (error) {
+      if (isApiNetworkError(error) || !(await isDeviceOnline())) return useOfflineDetails();
+      throw error;
+    } finally {
+      if (detailRequests.current.get(requestKey) === request) detailRequests.current.delete(requestKey);
     }
   }
 
-  async function queueAndTrySync(type: OfflineActionType, orderId: string, payload: unknown) {
+  async function queueAndTrySync(type: OfflineActionType, orderId: string, payload: unknown, draftKey?: string) {
     if (type === "finish_order") {
       const existingActions = await getPendingActions();
       await Promise.all(
@@ -1830,7 +1863,7 @@ function App() {
       );
     }
 
-    const queuedAction = await enqueueOfflineAction(type, orderId, payload);
+    const queuedAction = await enqueueOfflineAction(type, orderId, payload, { draftKey });
     setPendingSyncCount(await getPendingActionsCount());
 
     if (!(await isDeviceOnline())) {
@@ -1910,64 +1943,76 @@ function App() {
         observacao: typeof extraPayload.observacao === "string" ? extraPayload.observacao : "",
         id_ordem_servico: apiOrderCode,
         id_situacao_ordem_servico: statusId,
+        ...(typeof orderOrId !== "string" && orderOrId.equipmentOrderId
+          ? { id_ordem_servico_equipamento: orderOrId.equipmentOrderId }
+          : {}),
       });
     }
   }
 
   async function openClosingFlow() {
-    const questions = await fetchClosingQuestions(selectedOrder ?? undefined);
-    const savedDraft = localStorage.getItem(getClosingDraftKey(selectedOrder?.id ?? ""));
-    const restoredDraft = await restoreClosingDraft(savedDraft, questions);
-
-    setClosingQuestions(questions);
-    setClosingAnswers(restoredDraft.answers);
-    setClosingSubmitting(false);
-
-    if (selectedOrder && savedDraft) {
-      try {
-        saveClosingDraft(selectedOrder.id, restoredDraft.answers);
-      } catch {
-        // The validated state remains available in memory for this session.
-      }
-    }
-
-    if (restoredDraft.removedMedia > 0) {
-      setSyncMessage(
-        `${restoredDraft.removedMedia} mídia(s) antiga(s) não estavam mais no aparelho e foram removidas do rascunho. As outras respostas foram mantidas.`,
-      );
-    }
-    setClosingStep(0);
-    setClosingOrder(true);
-  }
-
-  function updateClosingAnswer(questionId: string, value: string | string[]) {
-    setClosingAnswers((current) => {
-      const next = {
-        ...current,
-        [questionId]: value,
-      };
-
-      if (selectedOrder) {
-        try {
-          saveClosingDraft(selectedOrder.id, next);
-        } catch {
-          setSyncMessage("Mídias carregadas. Rascunho grande será mantido nesta tela até finalizar.");
+    if (!selectedOrder || closingLoading) return;
+    const requestedOrderId = selectedOrder.id;
+    setClosingLoading(true);
+    try {
+      const detailedOrders = await loadServiceOrderDetails(requestedOrderId);
+      const order = detailedOrders?.find((item) => item.id === requestedOrderId);
+      if (!order || activeRoute.current.orderId !== requestedOrderId) return;
+      const questions = await fetchClosingQuestions(order);
+      const scope = getDraftScope(order);
+      const key = getScopedClosingDraftKey(scope);
+      let draft = closingDraftsByScope.current.get(key) ?? await readClosingDraft(scope);
+      if (!draft) {
+        const legacy = readLegacyClosingDraft(order.id);
+        if (legacy) {
+          draft = await writeClosingDraft(scope, legacy);
+          localStorage.removeItem(getClosingDraftKey(order.id));
         }
       }
-
-      return next;
-    });
+      const backendAnswers = readBackendClosingAnswers(order.questionnaireResponses, questions);
+      const answers = mergeClosingAnswers(questions, backendAnswers, draft);
+      const snapshot = await writeClosingDraft(scope, answers);
+      if (activeRoute.current.orderId !== requestedOrderId) return;
+      closingDraftsByScope.current.set(key, snapshot);
+      setClosingContext({ order, scope, key });
+      setClosingQuestions(questions);
+      setClosingAnswers(answers);
+      setClosingSubmitting(false);
+      setClosingStep(0);
+      setClosingOrder(true);
+    } catch (error) {
+      setErrorModal(error instanceof Error ? error.message : "Não foi possível abrir o rascunho. As respostas existentes foram preservadas.");
+    } finally {
+      setClosingLoading(false);
+    }
   }
 
-  function closeClosingFlow() {
-    if (closingSubmitting) {
-      return;
+  async function updateClosingAnswer(questionId: string, value: string | string[], context: ClosingContext, append = false) {
+    const previous = closingDraftsByScope.current.get(context.key) ?? null;
+    const previousAnswer = previous?.answers[questionId];
+    const next = { ...previous?.answers, [questionId]: append && Array.isArray(value)
+      ? mergeMediaAnswers(Array.isArray(previousAnswer) ? previousAnswer : [], value) : value };
+    closingDraftsByScope.current.set(context.key, createClosingDraftSnapshot(next, previous));
+    // An async photo preparation remains bound to the order where it started.
+    if (activeRoute.current.orderId === context.order.id && activeClosingContext.current?.key === context.key) setClosingAnswers(next);
+    try {
+      await writeClosingDraft(context.scope, next);
+    } catch {
+      setErrorModal("Não foi possível guardar o rascunho no aparelho. As respostas continuam nesta sessão; tente novamente antes de sair do aplicativo.");
     }
+  }
 
-    releaseMediaPreviewUrls(closingAnswers);
-    setClosingAnswers({});
-    setClosingOrder(false);
-    setClosingStep(0);
+  async function closeClosingFlow() {
+    if (closingSubmitting || !closingContext) return;
+    try {
+      const answers = closingDraftsByScope.current.get(closingContext.key)?.answers ?? closingAnswers;
+      await writeClosingDraft(closingContext.scope, answers);
+      releaseMediaPreviewUrls(closingAnswers);
+      setClosingOrder(false);
+      setClosingStep(0);
+    } catch {
+      setErrorModal("Não foi possível guardar o rascunho. Tente novamente antes de fechar o atendimento.");
+    }
   }
 
   function prepareAnswersForPost() {
@@ -2028,7 +2073,7 @@ function App() {
                 ...postMedia
               } = media;
               return {
-                ...postMedia,
+                ...(media.source === "remote" ? media.remotePayload : postMedia),
                 id_pergunta: question.apiQuestionId ?? question.id,
                 pergunta: question.label,
               };
@@ -2054,90 +2099,43 @@ function App() {
     });
   }
 
-  async function validateMediaBeforeFinish(order: ServiceOrder) {
-    const nextAnswers = { ...closingAnswers };
-    let firstInvalidStep = -1;
-    let removedMedia = 0;
-
-    for (const [questionIndex, question] of closingQuestions.entries()) {
-      if (question.step !== "media") {
-        continue;
-      }
-
-      const current = Array.isArray(nextAnswers[question.id]) ? nextAnswers[question.id] as string[] : [];
-      const valid: string[] = [];
-
-      for (const item of current) {
+  async function validateMediaBeforeFinish() {
+    for (const [index, question] of closingQuestions.entries()) {
+      if (question.step !== "media") continue;
+      const value = closingAnswers[question.id];
+      for (const item of Array.isArray(value) ? value : []) {
         const media = parseStoredMedia(item);
-
-        if (!media) {
-          removedMedia += 1;
-          continue;
-        }
-
-        try {
-          const stored = await getMedia(media.id);
-
-          if (!stored?.blob || stored.blob.size <= 0) {
-            removedMedia += 1;
-            continue;
-          }
-
-          valid.push(
-            JSON.stringify({
-              id: stored.id,
-              name: stored.name || media.name,
-              type: stored.type || media.type || inferMediaType(stored.name || media.name),
-              size: stored.blob.size,
-              createdAt: stored.createdAt || media.createdAt,
-            } satisfies SavedMedia),
-          );
-        } catch {
-          removedMedia += 1;
+        if (media?.source === "remote") continue;
+        const stored = media ? await getMedia(media.id) : null;
+        if (!stored?.blob || stored.blob.size <= 0) {
+          setClosingStep(index);
+          setErrorModal("Não foi possível ler uma mídia deste atendimento. O rascunho foi preservado. Tente novamente ou remova explicitamente o arquivo indisponível e adicione-o de novo.");
+          return false;
         }
       }
-
-      nextAnswers[question.id] = valid;
-
-      if (question.required && valid.length === 0) {
-        firstInvalidStep = firstInvalidStep < 0 ? questionIndex : firstInvalidStep;
-      }
     }
-
-    if (removedMedia > 0) {
-      releaseMediaPreviewUrls(closingAnswers);
-      setClosingAnswers(nextAnswers);
-
-      try {
-        saveClosingDraft(order.id, nextAnswers);
-      } catch {
-        // The corrected state remains available in memory.
-      }
-
-      if (firstInvalidStep >= 0) {
-        setClosingStep(firstInvalidStep);
-      }
-
-      setErrorModal(
-        `${removedMedia} mídia(s) não estavam mais disponíveis no aparelho e foram retiradas. Adicione-as novamente antes de finalizar. As demais respostas continuam salvas.`,
-      );
-      return false;
-    }
-
     return true;
   }
 
   async function finishOrder(order: ServiceOrder) {
-    if (closingSubmitting) {
+    if (closingSubmitting || !closingContext || closingContext.order.id !== order.id) {
+      return;
+    }
+
+    const invalidIndex = closingQuestions.findIndex((question) => question.required && !isQuestionAnswered(question, closingAnswers[question.id]));
+    if (invalidIndex >= 0 || !String(closingAnswers.assinatura ?? "").startsWith("data:image/") || !String(closingAnswers.responsavel ?? "").trim()) {
+      setClosingStep(invalidIndex >= 0 ? invalidIndex : Math.max(0, closingQuestions.findIndex((question) => question.step === "signature")));
+      setErrorModal("Preencha os campos obrigatórios e a assinatura do responsável antes de finalizar.");
       return;
     }
 
     setClosingSubmitting(true);
 
     try {
-      if (!(await validateMediaBeforeFinish(order))) {
+      if (!(await validateMediaBeforeFinish())) {
         return;
       }
+      await writeClosingDraft(closingContext.scope, closingAnswers);
 
       const postAnswers = prepareAnswersForPost();
       const responsibleName = String(closingAnswers.responsavel ?? "");
@@ -2152,13 +2150,22 @@ function App() {
           id_colaborador: idColaborador,
           id_ordem_servico: idOrdemServico,
           id_situacao_ordem_servico: 5,
+          ...(order.equipmentOrderId
+            ? { id_ordem_servico_equipamento: order.equipmentOrderId }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(order, "originPmoc")
+            ? { origem_pmoc: order.originPmoc }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(order, "activitiesPmoc")
+            ? { atividades_pmoc: order.activitiesPmoc }
+            : {}),
           id_questionario: order.questionnaireId ?? "",
           observacao: serviceObservation,
           nome_responsavel: responsibleName,
           assinatura: signature,
           perguntas_respostas: postAnswers,
           ordem: {
-            id: order.id,
+            id: order.apiId ?? order.id,
             numero: order.number,
             id_ordem_servico: idOrdemServico,
             id_cliente: order.clientId ?? "",
@@ -2172,7 +2179,7 @@ function App() {
             titulo: order.questionnaireTitle ?? "",
           },
           respostas: postAnswers,
-        });
+        }, closingContext.key);
 
         if (!syncResult.offline && syncResult.currentPending) {
           return;
@@ -2182,7 +2189,10 @@ function App() {
       }
 
       updateOrderStatus(order, 5, {}, false);
-      localStorage.removeItem(getClosingDraftKey(order.id));
+      if (!queuedOffline) {
+        await removeClosingDraft(closingContext.scope);
+      }
+      closingDraftsByScope.current.delete(closingContext.key);
       releaseMediaPreviewUrls(closingAnswers);
       setClosingAnswers({});
       setClosingOrder(false);
@@ -2254,12 +2264,26 @@ function App() {
         observacao: reason,
         id_ordem_servico: order.apiOrderCode ?? order.number.replace(/\D/g, "") ?? order.id,
         id_situacao_ordem_servico: 4,
+        ...(order.equipmentOrderId
+          ? { id_ordem_servico_equipamento: order.equipmentOrderId }
+          : {}),
       });
     }
     setSuspendingOrder(false);
   }
 
-  function resetTestOrder() {
+  async function resetTestOrder() {
+    const testOrder = orders.find((order) => order.id === testOrderId);
+    if (testOrder) {
+      const scope = getDraftScope(testOrder);
+      try {
+        await removeClosingDraft(scope);
+        closingDraftsByScope.current.delete(getScopedClosingDraftKey(scope));
+      } catch {
+        setErrorModal("Não foi possível reiniciar o rascunho da ordem de teste.");
+        return;
+      }
+    }
     setOrders((current) =>
       current.map((order) =>
         order.id === testOrderId
@@ -2430,8 +2454,8 @@ function App() {
               title="Mostrar todas as ordens"
             >
               <span className="orders-total">
-                <strong>{orders.length}</strong>
-                <span>{orders.length === 1 ? "ordem carregada" : "ordens carregadas"}</span>
+                <strong>{homeOrderGroups.length}</strong>
+                <span>{homeOrderGroups.length === 1 ? "ordem carregada" : "ordens carregadas"}</span>
               </span>
               <span className="sync-info">
                 <span className={isOnline === null ? "checking-dot" : isOnline ? "online-dot" : "offline-dot"}>
@@ -2484,17 +2508,20 @@ function App() {
 
           {ordersLoading && <p className="orders-state">Carregando ordens de serviço...</p>}
 
-          {!ordersLoading && orders.length === 0 && (
+          {!ordersLoading && homeOrderGroups.length === 0 && (
             <p className="orders-state">Nenhuma ordem de serviço encontrada para este usuário.</p>
           )}
 
-          {!ordersLoading && orders.length > 0 && visibleOrders.length === 0 && (
+          {!ordersLoading && homeOrderGroups.length > 0 && visibleOrderGroups.length === 0 && (
             <p className="orders-state">Nenhuma ordem nesta situação.</p>
           )}
 
           <div className="orders-list">
-            {visibleOrders.map((order) => (
-              <article className="order-card" key={order.id}>
+            {visibleOrderGroups.map((group) => {
+              const order = group.representative;
+
+              return (
+              <article className="order-card" key={group.id}>
                 <div className="order-card-top">
                   <span className="order-number">{order.number}</span>
                   <span className={`order-status status-${order.statusId}`}>
@@ -2528,14 +2555,15 @@ function App() {
                 <button
                   type="button"
                   className="primary-button order-action"
-                  onClick={() => navigateTo(`/ordem/${order.id}`)}
+                  onClick={() => navigateTo(`/ordem/${group.id}`)}
                 >
                   <ClipboardList size={24} />
                   Abrir ordem de serviço
                   <ChevronRight size={26} />
                 </button>
               </article>
-            ))}
+              );
+            })}
           </div>
 
           {errorModal && (
@@ -2616,6 +2644,7 @@ function App() {
     const canMove = ![2, 3, 5, 6].includes(order.statusId);
     const canStartService = ![3, 5, 6].includes(order.statusId);
     const canSuspend = [1, 2, 3].includes(order.statusId);
+    const parentEquipmentGroup = orderGroups.find((group) => group.isEquipmentBased && group.orders.some((item) => item.id === order.id));
 
     return (
       <main className="app-shell app-shell-orders">
@@ -2627,7 +2656,7 @@ function App() {
               onClick={() => {
                 setClosingOrder(false);
                 setSuspendingOrder(false);
-                navigateTo("/ordens");
+                navigateTo(parentEquipmentGroup ? `/ordem/${parentEquipmentGroup.id}` : "/ordens");
               }}
               aria-label="Voltar"
               title="Voltar"
@@ -2676,6 +2705,32 @@ function App() {
             )}
           </article>
 
+          {order.equipment && (
+            <details className="detail-card equipment-detail-fields">
+              <summary>Dados do equipamento</summary>
+              <dl className="equipment-selection-data">
+                {[
+                  ["Código da etiqueta", order.equipment.labelCode],
+                  ["Ambiente", order.equipment.environment],
+                  ["Marca", order.equipment.brand],
+                  ["Modelo", order.equipment.model],
+                  ["Número de série", order.equipment.serialNumber],
+                  ["Local", order.equipment.location],
+                  ["Endereço do equipamento", order.equipment.address],
+                  ["Tipo do equipamento", order.equipment.equipmentType],
+                  ["Capacidade BTUs", order.equipment.capacityBtus],
+                  ["Tensão", order.equipment.voltage],
+                  ["Gás refrigerante", order.equipment.refrigerantGas],
+                  ["Local de instalação", order.equipment.installationLocation],
+                  ["Pavimento", order.equipment.floor],
+                  ["Observação", order.equipment.observation],
+                ].map(([label, value]) => (
+                  <div key={label}><dt>{label}</dt><dd>{value || "Não informado"}</dd></div>
+                ))}
+              </dl>
+            </details>
+          )}
+
           <div className="action-grid">
             <button
               type="button"
@@ -2706,9 +2761,9 @@ function App() {
               </button>
             )}
             {order.statusId === 3 && (
-              <button type="button" className="stage-button finish" onClick={openClosingFlow}>
+              <button type="button" className="stage-button finish" disabled={closingLoading} onClick={openClosingFlow}>
                 <Flag size={21} />
-                Encerrar atendimento
+                {closingLoading ? "Carregando atendimento..." : "Encerrar atendimento"}
               </button>
             )}
             {order.id === testOrderId && (
@@ -2741,14 +2796,15 @@ function App() {
             <SuspendModal onCancel={() => setSuspendingOrder(false)} onConfirm={(reason) => handleSuspend(reason, order)} />
           )}
 
-          {closingOrder && (
+          {closingOrder && closingContext && closingContext.order.id === order.id && (
             <ClosingModal
+              key={`${closingContext.key}:${closingStep}`}
               answers={closingAnswers}
               currentStep={closingStep}
-              onAnswer={updateClosingAnswer}
+              onAnswer={(questionId, value, append) => void updateClosingAnswer(questionId, value, closingContext, append)}
               onBack={() => setClosingStep((current) => Math.max(0, current - 1))}
               onClose={closeClosingFlow}
-              onFinish={() => finishOrder(order)}
+              onFinish={() => void finishOrder(closingContext.order)}
               onNext={() => setClosingStep((current) => Math.min(closingQuestions.length - 1, current + 1))}
               questions={closingQuestions}
               submitting={closingSubmitting}
@@ -2789,6 +2845,91 @@ function App() {
     );
   }
 
+  function renderEquipmentList(group: ServiceOrderGroup<ServiceOrder>) {
+    const order = group.representative;
+
+    return (
+      <main className="app-shell app-shell-orders">
+        <section className="order-detail-screen equipment-selection-screen" aria-label="Equipamentos da ordem de serviço">
+          <header className="detail-header">
+            <button
+              type="button"
+              className="back-button"
+              onClick={() => navigateTo("/ordens")}
+              aria-label="Voltar"
+              title="Voltar"
+            >
+              <ArrowLeft size={22} />
+            </button>
+            <div>
+              <span>{order.number}</span>
+              <h1>Equipamentos da ordem</h1>
+            </div>
+            <button type="button" className="logout-button detail-logout" onClick={handleLogout} aria-label="Sair" title="Sair">
+              <LogOut size={20} />
+            </button>
+          </header>
+
+          <article className="equipment-order-summary">
+            <div>
+              <span>Cliente</span>
+              <strong>{order.client}</strong>
+            </div>
+            <span className={`order-status status-${order.statusId}`}>
+              <Clock3 size={17} />
+              {order.status}
+            </span>
+          </article>
+
+          <div className="equipment-selection-list">
+            {group.orders.map((equipmentOrder) => {
+              const equipment = equipmentOrder.equipment;
+
+              return (
+                <button
+                  type="button"
+                  className="equipment-selection-card"
+                  key={equipmentOrder.id}
+                  onClick={() => navigateTo(`/ordem/${equipmentOrder.id}`)}
+                >
+                  <div className="equipment-selection-heading">
+                    <span className="equipment-selection-icon"><Wrench size={23} /></span>
+                    <div>
+                      <small>Código da etiqueta</small>
+                      <strong>{equipment?.labelCode || "Não informado"}</strong>
+                    </div>
+                    <ChevronRight size={24} />
+                  </div>
+                  <dl className="equipment-selection-data">
+                    <div>
+                      <dt>Ambiente</dt>
+                      <dd>{equipment?.environment || "Não informado"}</dd>
+                    </div>
+                    <div>
+                      <dt>Marca</dt>
+                      <dd>{equipment?.brand || "Não informado"}</dd>
+                    </div>
+                    <div>
+                      <dt>Modelo</dt>
+                      <dd>{equipment?.model || "Não informado"}</dd>
+                    </div>
+                    <div>
+                      <dt>Número de série</dt>
+                      <dd>{equipment?.serialNumber || "Não informado"}</dd>
+                    </div>
+                  </dl>
+                  <span className={`equipment-selection-status status-${equipmentOrder.statusId}`}>
+                    {equipmentOrder.status}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   if (!isLoggedIn || route.page === "login") {
     return renderLogin();
   }
@@ -2810,7 +2951,40 @@ function App() {
   }
 
   if (route.page === "order") {
-    return selectedOrder ? renderOrderDetail(selectedOrder) : renderOrders();
+    if ((selectedOrder || selectedOrderGroup) && (detailsLoading || resolvedDetailRoute !== route.orderId)) {
+      return (
+        <main className="app-shell app-shell-orders">
+          <section className="order-detail-screen">
+            <header className="detail-header">
+              <button type="button" className="back-button" onClick={() => navigateTo("/ordens")} aria-label="Voltar"><ArrowLeft size={22} /></button>
+              <h1>Detalhes da ordem</h1>
+            </header>
+            <article className="detail-card" aria-live="polite">
+              <p>{detailsError || "Carregando dados da ordem..."}</p>
+              {detailsError && <button type="button" className="stage-button" disabled={detailsLoading} onClick={() => {
+                const routeId = route.orderId!;
+                setDetailsLoading(true);
+                setDetailsError("");
+                void loadServiceOrderDetails(routeId).then((result) => {
+                  if (activeRoute.current.orderId === routeId && result) setResolvedDetailRoute(routeId);
+                }).catch((error: unknown) => {
+                  if (activeRoute.current.orderId === routeId) setDetailsError(error instanceof Error ? error.message : "Não foi possível carregar os detalhes.");
+                }).finally(() => setDetailsLoading(false));
+              }}>Tentar novamente</button>}
+            </article>
+          </section>
+        </main>
+      );
+    }
+    if (selectedOrder) {
+      return renderOrderDetail(selectedOrder);
+    }
+
+    if (selectedOrderGroup?.isEquipmentBased) {
+      return renderEquipmentList(selectedOrderGroup);
+    }
+
+    return renderOrders();
   }
 
   return renderOrders();

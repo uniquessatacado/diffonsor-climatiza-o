@@ -1,9 +1,11 @@
 {
   "name": "diffonso-vistoria-app",
-  "version": "0.1.0",
+  "version": "1.14.0",
   "private": true,
   "type": "module",
   "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test scripts/test-service-orders.mjs tests/closingDrafts.test.mjs scripts/test-offline-sync.cjs scripts/test-closing-flow.cjs",
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",

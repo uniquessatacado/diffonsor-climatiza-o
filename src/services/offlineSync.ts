@@ -13,6 +13,10 @@ const maxNativeMediaBytes = 12 * 1024 * 1024;
 
 export type OfflineActionType = "status_change" | "suspend_order" | "finish_order";
 
+export type OfflineActionMetadata = {
+  draftKey?: string;
+};
+
 export type OfflineAction = {
   id: string;
   type: OfflineActionType;
@@ -20,6 +24,7 @@ export type OfflineAction = {
   payload: unknown;
   createdAt: string;
   attempts: number;
+  localMetadata?: OfflineActionMetadata;
 };
 
 type StoredMediaRecord = {
@@ -44,6 +49,7 @@ export type PendingActionSummary = {
   orderCode: string;
   createdAt: string;
   attempts: number;
+  statusId?: number;
 };
 
 function createLocalId() {
@@ -120,6 +126,31 @@ async function deleteAction(actionId: string) {
   });
 }
 
+async function acknowledgeAction(action: OfflineAction) {
+  const db = await openDb();
+  const draftKey = action.type === "finish_order" ? action.localMetadata?.draftKey : undefined;
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction([queueStore, settingsStore], "readwrite");
+    transaction.objectStore(queueStore).delete(action.id);
+
+    if (draftKey?.startsWith("diffonso.closingDraft.v2.")) {
+      transaction.objectStore(settingsStore).delete(draftKey);
+    }
+
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+
+  if (action.type === "finish_order") {
+    await deleteStatusActionsForOrder(
+      getPayloadValue(action.payload, "id_ordem_servico") || action.orderId,
+      getPayloadValue(action.payload, "id_ordem_servico_equipamento"),
+    );
+  }
+}
+
 function getPayloadValue(payload: unknown, key: string) {
   if (!payload || typeof payload !== "object") {
     return "";
@@ -142,6 +173,8 @@ function isAlreadyAppliedError(message: string) {
 }
 
 function summarizeAction(action: OfflineAction): PendingActionSummary {
+  const statusId = Number(getPayloadValue(action.payload, "id_situacao_ordem_servico"));
+
   return {
     id: action.id,
     type: action.type,
@@ -149,6 +182,7 @@ function summarizeAction(action: OfflineAction): PendingActionSummary {
     orderCode: getPayloadValue(action.payload, "id_ordem_servico") || action.orderId,
     createdAt: action.createdAt,
     attempts: action.attempts,
+    ...(Number.isInteger(statusId) && statusId > 0 ? { statusId } : {}),
   };
 }
 
@@ -196,6 +230,8 @@ function collectMediaRefs(
   };
 
   if (
+    record.source !== "remote" &&
+    ![record.url, record.uri].some((value) => typeof value === "string" && /^https?:\/\//i.test(value)) &&
     typeof record.id === "string" &&
     typeof record.name === "string" &&
     typeof record.createdAt === "string" &&
@@ -210,6 +246,30 @@ function collectMediaRefs(
   }
 
   Object.values(record).forEach((item) => collectMediaRefs(item, refs, nextContext));
+  return refs;
+}
+
+function collectRemoteMedia(value: unknown, refs = new Map<string, Record<string, unknown>>()) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectRemoteMedia(item, refs));
+    return refs;
+  }
+
+  if (!value || typeof value !== "object") {
+    return refs;
+  }
+
+  const record = value as Record<string, unknown>;
+  const url = [record.url, record.uri].find((item) => typeof item === "string" && /^https?:\/\//i.test(item));
+
+  if (record.source === "remote" || url) {
+    const id = record.id_midia ?? record.id;
+    const key = id != null ? `id:${String(id)}` : `url:${String(url)}`;
+    refs.set(key, record);
+    return refs;
+  }
+
+  Object.values(record).forEach((item) => collectRemoteMedia(item, refs));
   return refs;
 }
 
@@ -359,14 +419,19 @@ export async function clearPendingActions() {
   });
 }
 
-async function deleteStatusActionsForOrder(orderCode: string) {
+async function deleteStatusActionsForOrder(orderCode: string, equipmentOrderId = "") {
   const queue = await readQueue();
 
   await Promise.all(
     queue
       .filter((action) => {
         const actionOrderCode = getPayloadValue(action.payload, "id_ordem_servico") || action.orderId;
-        return action.type === "status_change" && String(actionOrderCode) === String(orderCode);
+        const actionEquipmentOrderId = getPayloadValue(action.payload, "id_ordem_servico_equipamento");
+        const sameTarget = equipmentOrderId
+          ? actionEquipmentOrderId === equipmentOrderId
+          : !actionEquipmentOrderId;
+
+        return action.type === "status_change" && String(actionOrderCode) === String(orderCode) && sameTarget;
       })
       .map((action) => deleteAction(action.id)),
   );
@@ -406,6 +471,7 @@ export async function enqueueOfflineAction(
   type: OfflineActionType,
   orderId: string,
   payload: unknown,
+  localMetadata?: OfflineActionMetadata,
 ) {
   const action: OfflineAction = {
     id: createLocalId(),
@@ -414,6 +480,7 @@ export async function enqueueOfflineAction(
     payload,
     createdAt: new Date().toISOString(),
     attempts: 0,
+    ...(localMetadata ? { localMetadata } : {}),
   };
 
   await putAction(action);
@@ -480,10 +547,28 @@ async function postAction(action: OfflineAction) {
     return { ok: false, missingUrl: true };
   }
 
+  const payload = action.payload as Record<string, unknown>;
+  const signature = payload?.assinatura;
+  let signatureBlob: Blob | null = null;
+
+  if (typeof signature === "string" && /^data:image\/[\w.+-]+;base64,/i.test(signature)) {
+    try {
+      signatureBlob = dataUrlToBlob(signature);
+    } catch {
+      // Keep an invalid queued signature pending rather than sending an unsigned report.
+    }
+  }
+
+  if (action.type === "finish_order" && !signatureBlob?.size) {
+    return {
+      ok: false,
+      error: `OS ${payload?.id_ordem_servico ?? action.orderId}: a assinatura do responsável é obrigatória. Abra o atendimento e assine antes de finalizar.`,
+    };
+  }
+
   const formData = new FormData();
   const mediaRefs = Array.from(collectMediaRefs(action.payload).values());
   const fileMeta: Array<Record<string, unknown>> = [];
-  const payload = action.payload as Record<string, unknown>;
   let nativeMediaBytes = 0;
 
   formData.append("dados", JSON.stringify(payload));
@@ -495,41 +580,38 @@ async function postAction(action: OfflineAction) {
     }
   });
 
-  const signature = payload.assinatura;
-
-  if (typeof signature === "string" && signature.startsWith("data:image/")) {
-    const signatureBlob = dataUrlToBlob(signature);
-
-    if (signatureBlob) {
-      formData.append("assinatura", signatureBlob, "assinatura.png");
-      formData.append(
-        "assinaturaMeta",
-        JSON.stringify({
-          campo: "assinatura",
-          id: "assinatura",
-          nome: "assinatura.png",
-          tipo: signatureBlob.type,
-          tamanho: signatureBlob.size,
-        }),
-      );
-      formData.append(
-        "fileMetaAssinatura",
-        JSON.stringify({
+  if (signatureBlob) {
+    formData.append("assinatura", signatureBlob, "assinatura.png");
+    formData.append(
+      "assinaturaMeta",
+      JSON.stringify({
         campo: "assinatura",
         id: "assinatura",
         nome: "assinatura.png",
         tipo: signatureBlob.type,
         tamanho: signatureBlob.size,
-        }),
-      );
-    }
+      }),
+    );
+    formData.append(
+      "fileMetaAssinatura",
+      JSON.stringify({
+        campo: "assinatura",
+        id: "assinatura",
+        nome: "assinatura.png",
+        tipo: signatureBlob.type,
+        tamanho: signatureBlob.size,
+      }),
+    );
   }
 
   for (const [index, mediaRef] of mediaRefs.entries()) {
     const media = await getMedia(mediaRef.id);
 
     if (!media) {
-      continue;
+      return {
+        ok: false,
+        error: `OS ${payload.id_ordem_servico ?? action.orderId}: a mídia ${mediaRef.name} não está mais salva no aparelho. A pendência foi mantida para evitar o envio incompleto do relatório.`,
+      };
     }
 
     nativeMediaBytes += media.size;
@@ -599,7 +681,7 @@ async function postAction(action: OfflineAction) {
       const mediaById = new Map(mediaPayloads.map((media) => [String(media.id), media]));
       const payloadWithMedia = {
         ...(attachMediaPayloads(payload, mediaById) as Record<string, unknown>),
-        midias: mediaPayloads,
+        midias: [...collectRemoteMedia(payload).values(), ...mediaPayloads],
       };
       const jsonResponse = await fetch(targetUrl, {
         method: "POST",
@@ -637,21 +719,13 @@ async function postAction(action: OfflineAction) {
       return { ok: false, error: `OS ${payload.id_ordem_servico ?? action.orderId}: ${jsonError}` };
     }
 
-    if (isAlreadyAppliedError(error)) {
-      return { ok: true };
-    }
-
     return { ok: false, error: `OS ${payload.id_ordem_servico ?? action.orderId}: ${error}` };
-  }
-
-  if (action.type === "finish_order") {
-    await deleteStatusActionsForOrder(String(payload.id_ordem_servico ?? action.orderId));
   }
 
   return { ok: true };
 }
 
-export async function syncPendingActions() {
+async function runPendingActionsSync() {
   if (!(await isDeviceOnline())) {
     return {
       synced: 0,
@@ -672,7 +746,7 @@ export async function syncPendingActions() {
       const result: SyncResult = await postAction(action);
 
       if (result.ok) {
-        await deleteAction(action.id);
+        await acknowledgeAction(action);
         synced += 1;
       } else {
         missingUrl = missingUrl || Boolean(result.missingUrl);
@@ -703,4 +777,20 @@ export async function syncPendingActions() {
     error,
     offline: false,
   };
+}
+
+let activeSync: ReturnType<typeof runPendingActionsSync> | null = null;
+
+export async function syncPendingActions() {
+  if (activeSync) {
+    return activeSync;
+  }
+
+  activeSync = runPendingActionsSync();
+
+  try {
+    return await activeSync;
+  } finally {
+    activeSync = null;
+  }
 }

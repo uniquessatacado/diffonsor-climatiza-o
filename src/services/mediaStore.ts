@@ -28,7 +28,7 @@ function createLocalId() {
   return `${Date.now()}-${randomPart}`;
 }
 
-function openDb() {
+export function openMediaDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(dbName, dbVersion);
 
@@ -58,7 +58,7 @@ function openDb() {
 }
 
 export async function saveMediaFiles(files: FileList | File[] | null) {
-  const db = await openDb();
+  const db = await openMediaDatabase();
   const fileList = Array.from(files ?? []);
 
   return Promise.all(
@@ -92,7 +92,7 @@ export async function savePreparedMediaFiles(
     metadata: StoredMedia;
   }>,
 ) {
-  const db = await openDb();
+  const db = await openMediaDatabase();
 
   return Promise.all(
     items.map(
@@ -113,7 +113,7 @@ export async function savePreparedMediaFiles(
 }
 
 export async function getMedia(id: string) {
-  const db = await openDb();
+  const db = await openMediaDatabase();
 
   return new Promise<StoredMediaRecord | null>((resolve, reject) => {
     const transaction = db.transaction(mediaStore, "readonly");
@@ -125,7 +125,7 @@ export async function getMedia(id: string) {
 }
 
 export async function deleteMedia(id: string) {
-  const db = await openDb();
+  const db = await openMediaDatabase();
 
   return new Promise<void>((resolve, reject) => {
     const transaction = db.transaction(mediaStore, "readwrite");
