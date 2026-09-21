@@ -117,23 +117,38 @@ test("individual equipment routes retain the selected item and registration rema
   assert.equal(context.routeFromPath("/ordens").page, "orders");
 });
 
-test("the equipment list has an order details button without selecting the first equipment", () => {
+test("each equipment card has its own details button without a general list button", () => {
   const { context, navigations } = makeHarness(["renderEquipmentList"]);
   const tree = context.renderEquipmentList(group);
-  const button = nodes(tree).find((node) => node.type === "button" && textContent(node).trim() === "Detalhes da OS");
-  assert.ok(button, "Detalhes da OS button must remain visible in the equipment list");
-  button.props.onClick();
-  assert.deepEqual(navigations, [`/ordem/${group.id}/detalhes`]);
+  const cards = nodes(tree).filter((node) => node.type === "article" && node.props.className?.includes("equipment-selection-card"));
+  const detailsButtons = nodes(tree).filter((node) => node.type === "button" && textContent(node).trim() === "Detalhes da OS");
+  assert.equal(cards.length, 2);
+  assert.equal(detailsButtons.length, cards.length, "There must be no additional general details button");
+  cards.forEach((card) => {
+    const buttons = nodes(card).filter((node) => node.type === "button" && textContent(node).trim() === "Detalhes da OS");
+    assert.equal(buttons.length, 1, "Each equipment must contain exactly one explicit details button");
+    assert.ok(detailsButtons.includes(buttons[0]));
+    buttons[0].props.onClick();
+  });
+  assert.deepEqual(navigations, [`/ordem/${firstOrder.id}`, `/ordem/${secondOrder.id}`]);
+  nodes(tree).filter((node) => node.type === "button").forEach((button) => {
+    assert.equal(nodes(button.props.children).some((node) => node.type === "button"), false, "Buttons must never be nested");
+  });
 });
 
-test("equipment cards keep navigating to their own item", () => {
+test("each equipment card keeps a separate arrow button targeting its own item", () => {
   const { context, navigations } = makeHarness(["renderEquipmentList"]);
-  const cards = nodes(context.renderEquipmentList(group)).filter((node) => node.type === "button" && node.props.className?.includes("equipment-selection-card"));
+  const cards = nodes(context.renderEquipmentList(group)).filter((node) => node.type === "article" && node.props.className?.includes("equipment-selection-card"));
   assert.equal(cards.length, 2);
   assert.match(textContent(cards[1]), /Modelo B/);
   assert.match(textContent(cards[1]), /Aguardando atendimento/);
-  cards[1].props.onClick();
-  assert.deepEqual(navigations, [`/ordem/${secondOrder.id}`]);
+  cards.forEach((card) => {
+    const arrows = nodes(card).filter((node) => node.type === "button" && node.props.className?.includes("equipment-selection-open"));
+    assert.equal(arrows.length, 1);
+    assert.ok(nodes(arrows[0]).some((node) => node.type === "ChevronRight"));
+    arrows[0].props.onClick();
+  });
+  assert.deepEqual(navigations, [`/ordem/${firstOrder.id}`, `/ordem/${secondOrder.id}`]);
 });
 
 test("orders without equipment enter their own detail route for all supported empty representations", async () => {
@@ -188,17 +203,39 @@ test("orders without equipment show the exact simple notice and keep service act
   assert.ok(nodes(tree).find((node) => node.type === "button" && textContent(node).trim() === "Cadastrar equipamento"));
 });
 
-test("equipment detail keeps its actual equipment fields instead of the empty notice", () => {
-  const { context } = makeHarness(["renderOrderDetail"]);
-  const tree = context.renderOrderDetail(secondOrder);
-  assert.doesNotMatch(textContent(tree), /Esta OS não tem equipamento cadastrado/);
-  assert.ok(nodes(tree).find((node) => node.type === "details"));
-  assert.match(textContent(tree), /Modelo B/);
-  assert.match(textContent(tree), /07\/03\/2026 14:30/);
-  assert.doesNotMatch(textContent(tree), /2026-03-07/);
-  const start = nodes(tree).find((node) => node.type === "button" && textContent(node).trim() === "Iniciar atendimento");
-  assert.ok(start);
-  assert.equal(start.props.disabled, false);
+test("the four equipment summary fields precede elapsed status and the full accordion remains", () => {
+  const { context } = makeHarness(["renderOrderDetail", "shouldShowElapsedStatus"]);
+  context.formatElapsedTime = () => "15 min";
+  for (const order of [firstOrder, secondOrder]) {
+    const tree = context.renderOrderDetail({ ...order, statusId: 3, status: "Atendimento Iniciado" });
+    assert.doesNotMatch(textContent(tree), /Esta OS não tem equipamento cadastrado/);
+    const mainCard = nodes(tree).find((node) => node.type === "article" && node.props.className?.includes("detail-card")
+      && nodes(node).some((child) => child.props?.className === "elapsed-status"));
+    assert.ok(mainCard, "Equipment identification and elapsed status must share the main order card");
+    const labels = nodes(mainCard).filter((node) => node.type === "dt").map(textContent);
+    assert.deepEqual(labels, ["Código da etiqueta", "Ambiente", "Marca", "Modelo"]);
+    const values = nodes(mainCard).filter((node) => node.type === "dd").map(textContent);
+    assert.deepEqual(values, [order.equipment.labelCode, order.equipment.environment, order.equipment.brand, order.equipment.model]);
+    const mainNodes = nodes(mainCard);
+    const summary = mainNodes.find((node) => node.type === "dl" && node.props.className?.includes("equipment-service-data"));
+    const elapsed = mainNodes.find((node) => node.props?.className === "elapsed-status");
+    assert.ok(summary);
+    assert.ok(mainNodes.indexOf(summary) < mainNodes.indexOf(elapsed), "The four summary fields must appear above elapsed status");
+    const accordions = nodes(tree).filter((node) => node.type === "details" && node.props.className?.includes("equipment-detail-fields"));
+    assert.equal(accordions.length, 1, "The complete equipment accordion must remain outside the main card");
+    const accordion = accordions[0];
+    assert.equal(mainNodes.includes(accordion), false);
+    assert.equal(textContent(nodes(accordion).find((node) => node.type === "summary")).trim(), "Dados do equipamento");
+    assert.deepEqual(nodes(accordion).filter((node) => node.type === "dt").map(textContent), [
+      "Código da etiqueta", "Ambiente", "Marca", "Modelo", "Número de série", "Local", "Endereço do equipamento",
+      "Tipo do equipamento", "Capacidade BTUs", "Tensão", "Gás refrigerante", "Local de instalação", "Pavimento", "Observação",
+    ]);
+    assert.ok(nodes(accordion).filter((node) => node.type === "dd").map(textContent).includes(order.equipment.serialNumber));
+    const other = order.id === firstOrder.id ? secondOrder : firstOrder;
+    assert.equal(textContent(tree).includes(other.equipment.model), false);
+    assert.match(textContent(mainCard), /07\/03\/2026 14:30/);
+    assert.doesNotMatch(textContent(mainCard), /2026-03-07/);
+  }
 });
 
 test("the multi-equipment overview waits for explicit selection before enabling service actions", () => {

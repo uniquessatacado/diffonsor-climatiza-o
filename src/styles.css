@@ -2379,17 +2379,30 @@ button.pending-sync {
   display: grid;
   gap: 14px;
   text-align: left;
+}
+
+.equipment-selection-open {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
   cursor: pointer;
 }
 
-.equipment-selection-card:focus-visible {
+.equipment-selection-open:focus-visible,
+.equipment-selection-card .stage-button:focus-visible {
   outline: 3px solid var(--lime-500);
   outline-offset: 3px;
 }
 
 .equipment-selection-heading {
   display: grid;
-  grid-template-columns: 46px minmax(0, 1fr) 24px;
+  grid-template-columns: 46px minmax(0, 1fr) 44px;
   align-items: center;
   gap: 11px;
 }
@@ -2428,6 +2441,10 @@ button.pending-sync {
   margin: 0;
   display: grid;
   gap: 9px;
+}
+
+.equipment-service-data {
+  margin-top: 16px;
 }
 
 .equipment-detail-fields summary {

@@ -2723,6 +2723,18 @@ function App() {
               <span className="row-icon"><Wrench size={23} /></span>
               {order.service}
             </p>
+            {!overviewGroup && order.equipment && (
+              <dl className="equipment-selection-data equipment-service-data">
+                {[
+                  ["Código da etiqueta", order.equipment.labelCode],
+                  ["Ambiente", order.equipment.environment],
+                  ["Marca", order.equipment.brand],
+                  ["Modelo", order.equipment.model],
+                ].map(([label, value]) => (
+                  <div key={label}><dt>{label}</dt><dd>{value || "Não informado"}</dd></div>
+                ))}
+              </dl>
+            )}
             {shouldShowElapsedStatus(order.statusId) && (
               <p className="elapsed-status">
                 {order.status} há {formatElapsedTime(order.statusStartedAt)}
@@ -2929,21 +2941,14 @@ function App() {
             </span>
           </article>
 
-          <button type="button" className="stage-button" onClick={() => navigateTo(getOrderDetailsPath(group))}>
-            <ClipboardList size={21} />
-            Detalhes da OS
-          </button>
-
           <div className="equipment-selection-list">
             {group.orders.map((equipmentOrder) => {
               const equipment = equipmentOrder.equipment;
 
               return (
-                <button
-                  type="button"
+                <article
                   className="equipment-selection-card"
                   key={equipmentOrder.id}
-                  onClick={() => navigateTo(`/ordem/${equipmentOrder.id}`)}
                 >
                   <div className="equipment-selection-heading">
                     <span className="equipment-selection-icon"><Wrench size={23} /></span>
@@ -2951,7 +2956,14 @@ function App() {
                       <small>Código da etiqueta</small>
                       <strong>{equipment?.labelCode || "Não informado"}</strong>
                     </div>
-                    <ChevronRight size={24} />
+                    <button
+                      type="button"
+                      className="equipment-selection-open"
+                      aria-label={`Abrir equipamento ${equipment?.labelCode || equipment?.model || "da ordem"}`}
+                      onClick={() => navigateTo(`/ordem/${equipmentOrder.id}`)}
+                    >
+                      <ChevronRight size={24} />
+                    </button>
                   </div>
                   <dl className="equipment-selection-data">
                     <div>
@@ -2974,7 +2986,15 @@ function App() {
                   <span className={`equipment-selection-status status-${equipmentOrder.statusId}`}>
                     {equipmentOrder.status}
                   </span>
-                </button>
+                  <button
+                    type="button"
+                    className="stage-button"
+                    onClick={() => navigateTo(`/ordem/${equipmentOrder.id}`)}
+                  >
+                    <ClipboardList size={21} />
+                    Detalhes da OS
+                  </button>
+                </article>
               );
             })}
           </div>
